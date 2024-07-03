@@ -834,8 +834,16 @@ runtime::Module CreateLLVMCrtMetadataModule(const Array<runtime::Module>& module
   auto cg = std::make_unique<CodeGenCPU>();
   cg->Init("TVMMetadataMod", llvm_target.operator->(), system_lib_prefix,
            system_lib_prefix.defined(), target_c_runtime);
+  // Open file .prefix to get the system lib prefix
+  std::string system_lib_prefix_str;
+  std::ifstream system_lib_prefix_file(".prefix");
+  if (system_lib_prefix_file.is_open()) {
+    std::getline(system_lib_prefix_file, system_lib_prefix_str);
+    system_lib_prefix_file.close();
+  }
+  Optional<String> pfix(system_lib_prefix_str.c_str());
 
-  cg->DefineFunctionRegistry(func_names);
+  cg->DefineFunctionRegistry(func_names,pfix);
   auto mod = cg->Finish();
   llvm_target->SetTargetMetadata(mod.get());
   mod->addModuleFlag(llvm::Module::Override, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);

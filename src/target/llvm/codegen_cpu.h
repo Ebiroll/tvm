@@ -81,7 +81,7 @@ class CodeGenCPU : public CodeGenLLVM {
    * \brief A CPU-specific function to create the FuncRegistry.
    * \param func_names List of functions to be included, in order.
    */
-  void DefineFunctionRegistry(Array<String> func_names);
+  void DefineFunctionRegistry(Array<String> func_names,Optional<String> prefix);
 
   /*!
    * \brief Serialize the metadata object as data, and implement get_c_metadata function.

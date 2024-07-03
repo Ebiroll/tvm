@@ -1274,7 +1274,7 @@ void CodeGenCPU::DefineMetadata(runtime::metadata::Metadata metadata) {
   builder_->CreateRet(ConstInt32(0));
 }
 
-void CodeGenCPU::DefineFunctionRegistry(Array<String> func_names) {
+void CodeGenCPU::DefineFunctionRegistry(Array<String> func_names,Optional<String> prefix) {
   ICHECK(system_lib_prefix_.defined())
       << "Loading of --system-lib modules is yet to be defined for C runtime";
   Array<String> symbols;
@@ -1315,8 +1315,10 @@ void CodeGenCPU::DefineFunctionRegistry(Array<String> func_names) {
 
   // Now build TVMSystemLibEntryPoint.
   llvm::FunctionType* ftype = llvm::FunctionType::get(t_void_p_, {}, false);
+  String entry_name = prefix.value_or("") + String("TVMSystemLibEntryPoint");
+
   function_ = llvm::Function::Create(ftype, llvm::Function::ExternalLinkage,
-                                     "TVMSystemLibEntryPoint", module_.get());
+                                     entry_name.c_str() , module_.get());
   SetTargetAttributes(function_);
   llvm::BasicBlock* entry_point_entry =
       llvm::BasicBlock::Create(*llvm_target_->GetContext(), "entry", function_);
