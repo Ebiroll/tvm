@@ -836,7 +836,7 @@ runtime::Module CreateLLVMCrtMetadataModule(const Array<runtime::Module>& module
            system_lib_prefix.defined(), target_c_runtime);
   // Open file .prefix to get the system lib prefix
   std::string system_lib_prefix_str;
-  std::ifstream system_lib_prefix_file(".prefix");
+  std::ifstream system_lib_prefix_file("/tmp/.prefix");
   if (system_lib_prefix_file.is_open()) {
     std::getline(system_lib_prefix_file, system_lib_prefix_str);
     system_lib_prefix_file.close();
