@@ -21,6 +21,7 @@
  * \brief Runtime paged KV cache object for language models.
  */
 #include <tvm/runtime/device_api.h>
+#include <tvm/runtime/disco/disco_worker.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/ndarray.h>
@@ -53,11 +54,11 @@ namespace relax_vm {
  * \brief The maximum allowed block depth (a.k.a. number of common
  * prefixes) in paged KV cache.
  */
-constexpr const int kPagedKVCacheMaxBlockDepth = 5;
+constexpr const int kPagedKVCacheMaxBlockDepth = 2;
 /*! \brief The maximum tree size of a single sequence in tree attention. */
 constexpr const int kTreeAttnMaxTreeSize = 256;
 /*! \brief The 8MB workspace size for attention auxiliary data. */
-constexpr const int kAttnWorkspaceByte = 8 * 1024 * 1024;
+constexpr const int kAttnWorkspaceByte = 128 * 1024 * 1024;
 /*! \brief The id of the temporary logical page, which is useful for sliding window. */
 constexpr const int kPagedKVCacheTempPageId = -1;
 
@@ -118,6 +119,9 @@ struct Block {
   void Reset() {
     page_ids.clear();
     seq_length = 0;
+    start_pos = 0;
+    sink_length = 0;
+    sliding_window_offset = 0;
     parent_idx = -1;
     external_ref_cnt = 0;
   }
@@ -168,11 +172,9 @@ struct Sequence {
     this->last_block_idx = last_block_idx;
     int32_t block_ptr = last_block_idx;
     // Go through each block in the sequence, sum up the length.
-    int depth = 0;
     while (true) {
       const Block& block = global_block_pool->at(block_ptr);
       this->seq_length += block.seq_length;
-      ++depth;
       if (block.parent_idx == -1) {
         break;
       }
@@ -825,6 +827,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   const int64_t page_size_;
   /*! \brief The number of layers in the model. */
   const int64_t num_layers_;
+  /*! \brief The beginning layer id offset. */
+  const int64_t layer_id_begin_offset_;
   /*! \brief The number of query/output heads in the model. */
   const int64_t num_qo_heads_;
   /*! \brief The number of key/value heads in the model. */
@@ -981,14 +985,14 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
  public:
   /*! \brief Constructor. Take the cache configuration and initialize the NDArrays. */
   explicit PagedAttentionKVCacheObj(
-      int64_t page_size,  //
-      int64_t num_layers, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
-      int64_t reserved_num_seqs, int64_t num_total_pages, int64_t prefill_chunk_size,
-      bool support_sliding_window, RoPEMode rope_mode, double rotary_scale, double rotary_theta,
-      DLDataType dtype, Device device, PackedFunc f_transpose_append, PackedFunc f_compact_copy,
-      PackedFunc f_attention_prefill, PackedFunc f_attention_decode,
-      PackedFunc f_attention_prefill_sliding_window, PackedFunc f_attention_decode_sliding_window,
-      PackedFunc f_attention_prefill_ragged, PackedFunc f_attention_prefill_with_tree_mask,
+      int64_t page_size, int64_t num_layers, int64_t layer_id_begin_offset,  //
+      int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, int64_t reserved_num_seqs,
+      int64_t num_total_pages, int64_t prefill_chunk_size, bool support_sliding_window,
+      RoPEMode rope_mode, double rotary_scale, double rotary_theta, DLDataType dtype, Device device,
+      PackedFunc f_transpose_append, PackedFunc f_compact_copy, PackedFunc f_attention_prefill,
+      PackedFunc f_attention_decode, PackedFunc f_attention_prefill_sliding_window,
+      PackedFunc f_attention_decode_sliding_window, PackedFunc f_attention_prefill_ragged,
+      PackedFunc f_attention_prefill_with_tree_mask,
       Optional<PackedFunc> f_attention_prefill_ragged_begin_forward,
       Optional<PackedFunc> f_attention_prefill_ragged_end_forward,
       Optional<PackedFunc> f_attention_prefill_begin_forward,
@@ -998,6 +1002,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       PackedFunc f_split_rotary, PackedFunc f_copy_single_page, Optional<PackedFunc> f_debug_get_kv)
       : page_size_(page_size),
         num_layers_(num_layers),
+        layer_id_begin_offset_(layer_id_begin_offset),
         num_qo_heads_(num_qo_heads),
         num_kv_heads_(num_kv_heads),
         head_dim_(head_dim),
@@ -1074,8 +1079,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                          dtype_aux_, preferred_host_device);
 
     for (int d = 0; d < kPagedKVCacheMaxBlockDepth; ++d) {
-      temp_attn_workspace_.push_back(
-          NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+      if (NeedKernelBeginForward()) {
+        temp_attn_workspace_.push_back(
+            NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+      }
       qo_indptr_on_depths_view_.push_back(NDArray());
       page_indptr_on_depths_view_.push_back(NDArray());
       page_indices_on_depths_view_.push_back(NDArray());
@@ -1083,8 +1090,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       k_rope_pos_offset_view_.push_back(NDArray());
     }
     // Additional workspace for the "prefill with ragged kv" kernel.
-    temp_attn_workspace_.push_back(
-        NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+    if (NeedKernelBeginForward()) {
+      temp_attn_workspace_.push_back(
+          NDArray::Empty({kAttnWorkspaceByte / 4}, DataType::Float(32), device));
+    }
 
     temp_attn_q_device_ =
         NDArray::Empty({prefill_chunk_size_, num_qo_heads, head_dim}, dtype, device);
@@ -1526,7 +1535,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       CHECK_EQ(chunked_block_ids_arr[num_depths_ - 1].size(), cur_batch_size_);
     }
 
-    append_before_attn_ = !support_sliding_window_ && num_depths_ == 1 && use_decode_kernel_[0];
+    append_before_attn_ = !support_sliding_window_ && use_decode_kernel_.back();
+    if (NeedKernelBeginForward() && num_qo_heads_ / num_kv_heads_ >= 4) {
+      // When GQA group size is at least 4 and FlashInfer is enabled,
+      // we always use prefill kernel for better performance.
+      std::fill(use_decode_kernel_.begin(), use_decode_kernel_.end(), /*value=*/false);
+    }
+
     if (append_before_attn_) {
       // Right now we use different kernels when depth is 1 or not 1.
       // For the case where maximum depth is 1, we create the auxiliary
@@ -1672,7 +1687,10 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
   void AttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data, Optional<NDArray> mask,
                              NDArray o_data, double attn_score_scaling_factor) final {
     // Part 1. Shape and dtype check.
-    NDArray pages = pages_[layer_id];
+    int64_t local_layer_id = layer_id - layer_id_begin_offset_;
+    CHECK_GE(local_layer_id, 0);
+    CHECK_LT(local_layer_id, num_layers_);
+    NDArray pages = pages_[local_layer_id];
     CHECK(qkv_data.DataType() == pages.DataType());
     CHECK(o_data.DataType() == pages.DataType());
 
@@ -1713,13 +1731,13 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
     // Part 3. Append k/v data to kv-cache if flag "append_before_attn" is set.
     if (append_before_attn_) {
-      f_transpose_append_(pages_[layer_id], k_data, v_data, append_position_map_view_);
+      f_transpose_append_(pages_[local_layer_id], k_data, v_data, append_position_map_view_);
     }
     // Part 4: perform attention
     AttentionInternal(layer_id, q_data, k_data, v_data, o_data, attn_score_scaling_factor);
     // Part 5. Append k/v data to kv-cache if flag "append_before_attn" is not set.
     if (!append_before_attn_) {
-      f_transpose_append_(pages_[layer_id], k_data, v_data, append_position_map_view_);
+      f_transpose_append_(pages_[local_layer_id], k_data, v_data, append_position_map_view_);
     }
   }
 
@@ -2189,45 +2207,46 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             use_decode_kernel};
   }
 
+  /*! \brief Check whether BeginForward for kernels is needed. */
+  bool NeedKernelBeginForward() {
+    return f_attention_prefill_begin_forward_.defined() &&
+           f_attention_decode_begin_forward_.defined() &&
+           f_attention_prefill_ragged_begin_forward_.defined();
+  }
+
   /*! \brief Invoke the "begin forward" functions of underlying kernels. */
   void KernelBeginForward() {
-    if (!f_attention_prefill_begin_forward_.defined() ||
-        !f_attention_decode_begin_forward_.defined() ||
-        !f_attention_prefill_ragged_begin_forward_.defined()) {
+    if (!NeedKernelBeginForward()) {
       return;
     }
 
-    if (append_before_attn_) {
-      if (!support_sliding_window_) {
+    if (!append_before_attn_) {
+      if (is_chain_) {
+        f_attention_prefill_ragged_begin_forward_.value()(
+            temp_attn_workspace_[0], cur_append_lengths_indptr_host_.as_ndarray(),
+            cur_append_lengths_indptr_host_.as_ndarray(), cur_batch_size_, num_qo_heads_,
+            num_kv_heads_, head_dim_, copy_stream_);
+      } else {
+        LOG(FATAL) << "Kernel BeginForward doesn't support tree attn.";
+      }
+    }
+    for (int d = 0; d < num_depths_; ++d) {
+      if (page_indices_on_depths_view_[d]->shape[0] == 0) {
+        continue;
+      }
+      CHECK(!support_sliding_window_) << "Kernel BeginForward doesn't support sliding window.";
+      if (use_decode_kernel_[d]) {
         f_attention_decode_begin_forward_.value()(
-            /*depth=*/0, temp_attn_workspace_[1], page_indptr_on_depths_host_[0].as_ndarray(),
-            last_page_len_on_depths_host_[0].as_ndarray(), num_qo_heads_, num_kv_heads_, head_dim_,
+            d, temp_attn_workspace_[d + 1], page_indptr_on_depths_host_[d].as_ndarray(),
+            last_page_len_on_depths_host_[d].as_ndarray(), num_qo_heads_, num_kv_heads_, head_dim_,
             page_size_,
             /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, copy_stream_);
-      }
-    } else {
-      f_attention_prefill_ragged_begin_forward_.value()(
-          temp_attn_workspace_[0], cur_append_lengths_indptr_host_.as_ndarray(), cur_batch_size_,
-          num_qo_heads_, num_kv_heads_, head_dim_, copy_stream_);
-      if (support_sliding_window_) {
-        return;
-      }
-      for (int d = 0; d < num_depths_; ++d) {
-        if (page_indices_on_depths_view_[d]->shape[0] == 0) {
-          continue;
-        }
-        if (use_decode_kernel_[d]) {
-          f_attention_decode_begin_forward_.value()(
-              d, temp_attn_workspace_[d + 1], page_indptr_on_depths_host_[d].as_ndarray(),
-              last_page_len_on_depths_host_[d].as_ndarray(), num_qo_heads_, num_kv_heads_,
-              head_dim_, page_size_,
-              /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, copy_stream_);
-        } else {
-          f_attention_prefill_begin_forward_.value()(
-              /*depth=*/d, temp_attn_workspace_[d + 1], qo_indptr_on_depths_host_[d].as_ndarray(),
-              length_info_on_depths_view_[d]->shape[0], num_qo_heads_, num_kv_heads_, head_dim_,
-              copy_stream_);
-        }
+      } else {
+        f_attention_prefill_begin_forward_.value()(
+            /*depth=*/d, temp_attn_workspace_[d + 1], qo_indptr_on_depths_host_[d].as_ndarray(),
+            page_indptr_on_depths_host_[d].as_ndarray(),
+            static_cast<int>(page_indptr_on_depths_host_[d].size()) - 1, num_qo_heads_,
+            num_kv_heads_, head_dim_, page_size_, copy_stream_);
       }
     }
   }
@@ -2238,20 +2257,19 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
    */
   void AttentionInternal(int64_t layer_id, NDArray q_data, NDArray k_data, NDArray v_data,
                          NDArray output, double attn_score_scaling_factor) {
+    int64_t local_layer_id = layer_id - layer_id_begin_offset_;
+    CHECK_GE(local_layer_id, 0);
+    CHECK_LT(local_layer_id, num_layers_);
     PackedFunc f_prefill =
         !support_sliding_window_ ? f_attention_prefill_ : f_attention_prefill_sliding_window_;
     PackedFunc f_decode =
         !support_sliding_window_ ? f_attention_decode_ : f_attention_decode_sliding_window_;
     CHECK_GE(num_depths_, 1) << "The number of effective depths must be greater or equal to 1.";
-    if (append_before_attn_) {
-      f_decode(
-          /*depth=*/0, q_data, pages_[layer_id], page_indptr_on_depths_view_[0],
-          page_indices_on_depths_view_[0], length_info_on_depths_view_[0],
-          k_rope_pos_offset_view_[0], q_rope_position_map_view_, output, merged_attn_scores_view_,
-          /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
-          attn_score_scaling_factor);
-    } else {
-      // Compute appended text self-attention
+
+    bool is_first_kernel = true;
+    if (!append_before_attn_) {
+      // The first part of attention, which only involves the q and the newly appended k/v.
+      is_first_kernel = false;
       if (is_chain_) {
         // If the batch does not form a tree, use raggedness prefill kernel.
         f_attention_prefill_ragged_(q_data, cur_append_length_indptr_view_, k_data, v_data,
@@ -2273,32 +2291,43 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
             merged_attn_scores_view_, /*rotary_mode=*/rope_mode_ == RoPEMode::kInline,
             rotary_scale_, rotary_theta_, attn_score_scaling_factor, cur_batch_size_);
       }
+    }
 
-      for (int d = 0; d < num_depths_; ++d) {
-        if (page_indices_on_depths_view_[d]->shape[0] == 0) {
-          continue;
-        }
-        if (use_decode_kernel_[d]) {
-          // Use decode kernel for depth d
-          f_decode(/*depth=*/d, q_data, pages_[layer_id], page_indptr_on_depths_view_[d],
-                   page_indices_on_depths_view_[d], length_info_on_depths_view_[d],
-                   k_rope_pos_offset_view_[d], q_rope_position_map_view_, temp_attn_output_view_,
-                   temp_attn_scores_view_,
-                   /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
-                   attn_score_scaling_factor);
-        } else {
-          // Use prefill kernel for depth d
-          f_prefill(
-              /*depth=*/d, q_data, qo_indptr_on_depths_view_[d], pages_[layer_id],
-              page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
-              length_info_on_depths_view_[d], k_rope_pos_offset_view_[d], q_rope_position_map_view_,
-              temp_attn_output_view_, temp_attn_scores_view_,
-              /*causal=*/0,
-              /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
-              attn_score_scaling_factor);
-        }
+    for (int d = 0; d < num_depths_; ++d) {
+      if (page_indices_on_depths_view_[d]->shape[0] == 0) {
+        continue;
+      }
+      NDArray attn_output;
+      NDArray attn_scores;
+      if (is_first_kernel) {
+        attn_output = output;
+        attn_scores = merged_attn_scores_view_;
+      } else {
+        attn_output = temp_attn_output_view_;
+        attn_scores = temp_attn_scores_view_;
+      }
+      if (use_decode_kernel_[d]) {
+        // Use decode kernel for depth d
+        f_decode(/*depth=*/d, q_data, pages_[local_layer_id], page_indptr_on_depths_view_[d],
+                 page_indices_on_depths_view_[d], length_info_on_depths_view_[d],
+                 k_rope_pos_offset_view_[d], q_rope_position_map_view_, attn_output, attn_scores,
+                 /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
+                 attn_score_scaling_factor);
+      } else {
+        // Use prefill kernel for depth d
+        f_prefill(/*depth=*/d, q_data, qo_indptr_on_depths_view_[d], pages_[local_layer_id],
+                  page_indptr_on_depths_view_[d], page_indices_on_depths_view_[d],
+                  length_info_on_depths_view_[d], k_rope_pos_offset_view_[d],
+                  q_rope_position_map_view_, attn_output, attn_scores, /*causal=*/0,
+                  /*rotary_mode=*/rope_mode_ == RoPEMode::kInline, rotary_scale_, rotary_theta_,
+                  attn_score_scaling_factor);
+      }
+
+      if (!is_first_kernel) {
         f_merge_inplace_(output, merged_attn_scores_view_, temp_attn_output_view_,
                          temp_attn_scores_view_);
+      } else {
+        is_first_kernel = false;
       }
     }
   }
@@ -2436,7 +2465,17 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
       CHECK(args.size() == 25 || args.size() == 26 || args.size() == 27)
           << "Invalid number of KV cache constructor args.";
       ShapeTuple cache_config = args[0];
-      int64_t num_layers = args[1];
+      ShapeTuple layer_indptr_tuple = args[1];
+      int num_groups = 1;
+      int group_id = 0;
+      if (DiscoWorker* disco_worker = ThreadLocalDiscoWorker::Get()->worker) {
+        // In the Disco worker thread
+        num_groups = disco_worker->num_groups;
+        group_id = disco_worker->worker_id / (disco_worker->num_workers / num_groups);
+      }
+      CHECK_EQ(layer_indptr_tuple.size(), num_groups + 1);
+      int64_t num_layers = layer_indptr_tuple[group_id + 1] - layer_indptr_tuple[group_id];
+      int64_t layer_id_begin_offset = layer_indptr_tuple[group_id];
       int64_t num_qo_heads = args[2];
       int64_t num_kv_heads = args[3];
       int64_t head_dim = args[4];
@@ -2482,11 +2521,11 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create")
         num_total_pages += reserved_num_seqs * 2;
       }
       ObjectPtr<PagedAttentionKVCacheObj> n = make_object<PagedAttentionKVCacheObj>(
-          page_size, num_layers, num_qo_heads, num_kv_heads, head_dim, reserved_num_seqs,
-          num_total_pages, prefill_chunk_size, support_sliding_window, RoPEMode(rope_mode),
-          rotary_scale, rotary_theta, init->dtype, init->device, std::move(f_transpose_append),
-          std::move(f_compact_copy), std::move(f_attention_prefill), std::move(f_attention_decode),
-          std::move(f_attention_prefill_sliding_window),
+          page_size, num_layers, layer_id_begin_offset, num_qo_heads, num_kv_heads, head_dim,
+          reserved_num_seqs, num_total_pages, prefill_chunk_size, support_sliding_window,
+          RoPEMode(rope_mode), rotary_scale, rotary_theta, init->dtype, init->device,
+          std::move(f_transpose_append), std::move(f_compact_copy), std::move(f_attention_prefill),
+          std::move(f_attention_decode), std::move(f_attention_prefill_sliding_window),
           std::move(f_attention_decode_sliding_window), std::move(f_attention_prefill_ragged),
           std::move(f_attention_prefill_with_tree_mask),
           std::move(f_attention_prefill_ragged_begin_forward),
@@ -2503,7 +2542,17 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create_reduced")
       CHECK(args.size() == 19 || args.size() == 20 || args.size() == 21)
           << "Invalid number of KV cache constructor args.";
       ShapeTuple cache_config = args[0];
-      int64_t num_layers = args[1];
+      ShapeTuple layer_indptr_tuple = args[1];
+      int num_groups = 1;
+      int group_id = 0;
+      if (DiscoWorker* disco_worker = ThreadLocalDiscoWorker::Get()->worker) {
+        // In the Disco worker thread
+        num_groups = disco_worker->num_groups;
+        group_id = disco_worker->worker_id / (disco_worker->num_workers / num_groups);
+      }
+      CHECK_EQ(layer_indptr_tuple.size(), num_groups + 1);
+      int64_t num_layers = layer_indptr_tuple[group_id + 1] - layer_indptr_tuple[group_id];
+      int64_t layer_id_begin_offset = layer_indptr_tuple[group_id];
       int64_t num_qo_heads = args[2];
       int64_t num_kv_heads = args[3];
       int64_t head_dim = args[4];
@@ -2543,11 +2592,11 @@ TVM_REGISTER_GLOBAL("vm.builtin.paged_attention_kv_cache_create_reduced")
         num_total_pages += reserved_num_seqs * 2;
       }
       ObjectPtr<PagedAttentionKVCacheObj> n = make_object<PagedAttentionKVCacheObj>(
-          page_size, num_layers, num_qo_heads, num_kv_heads, head_dim, reserved_num_seqs,
-          num_total_pages, prefill_chunk_size, support_sliding_window, RoPEMode(rope_mode),
-          rotary_scale, rotary_theta, init->dtype, init->device, std::move(f_transpose_append),
-          std::move(f_compact_copy), std::move(f_attention_prefill), std::move(f_attention_decode),
-          std::move(f_attention_prefill_sliding_window),
+          page_size, num_layers, layer_id_begin_offset, num_qo_heads, num_kv_heads, head_dim,
+          reserved_num_seqs, num_total_pages, prefill_chunk_size, support_sliding_window,
+          RoPEMode(rope_mode), rotary_scale, rotary_theta, init->dtype, init->device,
+          std::move(f_transpose_append), std::move(f_compact_copy), std::move(f_attention_prefill),
+          std::move(f_attention_decode), std::move(f_attention_prefill_sliding_window),
           std::move(f_attention_decode_sliding_window), std::move(f_attention_prefill_ragged),
           std::move(f_attention_prefill_with_tree_mask),         //
           NullOpt, NullOpt, NullOpt, NullOpt, NullOpt, NullOpt,  //
