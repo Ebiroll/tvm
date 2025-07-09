@@ -801,6 +801,98 @@ TVM_FFI_REGISTER_GLOBAL("codegen.codegen_blob")
       return runtime::Module(n);
     });
 
+runtime::Module CreateLLVMCppMetadataModule(runtime::metadata::Metadata metadata, Target target,
+                                            tvm::relay::Runtime runtime) {
+  auto llvm_instance = std::make_unique<LLVMInstance>();
+  With<LLVMTarget> llvm_target(*llvm_instance, target);
+
+  Optional<String> system_lib_prefix = NullOpt;
+  if (runtime->GetAttr<Bool>("system-lib").value_or(Bool(false))) {
+    system_lib_prefix = "";
+  }
+
+  auto cg = std::make_unique<CodeGenCPU>();
+
+  cg->Init("TVMMetadataMod", llvm_target.get(), system_lib_prefix, system_lib_prefix.defined(),
+           /*target_c_runtime=*/false);
+
+  cg->DefineMetadata(metadata);
+  auto mod = cg->Finish();
+  llvm_target->SetTargetMetadata(mod.get());
+  mod->addModuleFlag(llvm::Module::Override, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+
+  mod->addModuleFlag(
+      llvm::Module::Override, "Dwarf Version",
+      llvm_target->GetOrCreateTargetMachine()->getTargetTriple().isOSDarwin() ? 2 : 4);
+
+  auto n = make_object<LLVMModuleNode>();
+  n->Init(std::move(mod), std::move(llvm_instance));
+  n->SetJITEngine(llvm_target->GetJITEngine());
+
+  auto meta_mod = MetadataModuleCreate(metadata);
+  meta_mod->Import(runtime::Module(n));
+  return meta_mod;
+}
+
+runtime::Module CreateLLVMCrtMetadataModule(const Array<runtime::Module>& modules, Target target,
+                                            tvm::relay::Runtime runtime) {
+  Array<String> func_names;
+  for (runtime::Module mod : modules) {
+    auto pf_funcs = mod.GetFunction("get_func_names");
+    if (pf_funcs != nullptr) {
+      Array<String> func_names_ = pf_funcs();
+      for (const auto& fname : func_names_) {
+        func_names.push_back(fname);
+      }
+    }
+  }
+
+  auto llvm_instance = std::make_unique<LLVMInstance>();
+  With<LLVMTarget> llvm_target(*llvm_instance, target);
+
+  Optional<String> system_lib_prefix = NullOpt;
+  if (runtime->GetAttr<Bool>("system-lib").value_or(Bool(false))) {
+    system_lib_prefix = "";
+  }
+
+  bool target_c_runtime = runtime->name == "crt";
+  ICHECK(system_lib_prefix.defined() && target_c_runtime)
+      << "For LLVM C-runtime metadata module, must include --system-lib and --runtime=c; "
+      << "got target: " << target->str();
+  auto cg = std::make_unique<CodeGenCPU>();
+  cg->Init("TVMMetadataMod", llvm_target.operator->(), system_lib_prefix,
+           system_lib_prefix.defined(), target_c_runtime);
+  // Open file .prefix to get the system lib prefix
+  std::string system_lib_prefix_str;
+  std::ifstream system_lib_prefix_file("/tmp/.prefix");
+  if (system_lib_prefix_file.is_open()) {
+    std::getline(system_lib_prefix_file, system_lib_prefix_str);
+    system_lib_prefix_file.close();
+  }
+  Optional<String> pfix(system_lib_prefix_str.c_str());
+
+  cg->DefineFunctionRegistry(func_names,pfix);
+  auto mod = cg->Finish();
+  llvm_target->SetTargetMetadata(mod.get());
+  mod->addModuleFlag(llvm::Module::Override, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+
+  mod->addModuleFlag(
+      llvm::Module::Override, "Dwarf Version",
+      llvm_target->GetOrCreateTargetMachine()->getTargetTriple().isOSDarwin() ? 2 : 4);
+
+  auto n = make_object<LLVMModuleNode>();
+  n->Init(std::move(mod), std::move(llvm_instance));
+  n->SetJITEngine(llvm_target->GetJITEngine());
+  for (auto m : modules) {
+    n->Import(m);
+  }
+  return runtime::Module(n);
+}
+
+TVM_REGISTER_GLOBAL("runtime.CreateLLVMCrtMetadataModule")
+    .set_body_typed(CreateLLVMCrtMetadataModule);
+
+
 }  // namespace codegen
 }  // namespace tvm
 
