@@ -169,6 +169,9 @@ class TFLiteGraphImporter:
 
     def from_tflite(self, model) -> IRModule:
         """Construct Relax expressions from the TFLite model."""
+        # Store model reference for use in other methods
+        self.current_model = model
+        
         with self.bb.function("main"):
             with self.bb.dataflow() as df:
                 self._parse_model_inputs(model)
@@ -693,8 +696,17 @@ class TFLiteGraphImporter:
         assert len(input_tensors) == 2
         
         data_expr = self._get_tensor_expr(input_tensors[0])
-        axes_value = self._get_tensor_value(input_tensors[1])
-        axes = tuple(axes_value.tolist()) if axes_value.size > 0 else None
+        
+        # Handle axes tensor
+        axes_tensor = input_tensors[1]
+        if self._has_tensor_value(axes_tensor):
+            axes_value = self._get_tensor_value(axes_tensor)
+            if axes_value is not None:
+                axes = tuple(axes_value.tolist()) if axes_value.size > 0 else None
+            else:
+                axes = None  # Use default behavior
+        else:
+            axes = None  # Use default behavior for dynamic case
         
         keepdims = False
         if op.BuiltinOptionsType() == BuiltinOptions.ReducerOptions:
