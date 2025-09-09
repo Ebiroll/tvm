@@ -163,6 +163,7 @@ class TFLiteGraphImporter:
             "SHAPE": self.convert_shape,
             "SOFTMAX": self.convert_softmax,
             "SQUEEZE": self.convert_squeeze,
+            "STRIDED_SLICE": self.convert_strided_slice,
             "SUB": self.convert_sub,
             "TANH": self.convert_tanh,
             "TRANSPOSE": self.convert_transpose,
@@ -620,8 +621,37 @@ class TFLiteGraphImporter:
         # for it to be used by other operators as a tensor input.
         shape_expr = relax.op.shape_of(input_expr)
         
-        # The output tensor is typically int32.
-        return self.bb.normalize(relax.op.vm.shape_to_tensor(shape_expr, "int32"))
+        # The output tensor is typically int32, but we let TVM infer it.
+        return self.bb.normalize(relax.op.shape_to_tensor(shape_expr))
+
+    def convert_strided_slice(self, subgraph, op):
+        """Convert TFLite STRIDED_SLICE operator."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.StridedSliceOptions import StridedSliceOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) >= 3
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        begin_expr = self._get_tensor_expr(input_tensors[1])
+        end_expr = self._get_tensor_expr(input_tensors[2])
+        
+        strides_expr = None
+        if len(input_tensors) > 3:
+            strides_expr = self._get_tensor_expr(input_tensors[3])
+
+        # TODO: Handle masks correctly. This is a simplified conversion.
+        # The masks (begin_mask, end_mask, etc.) can significantly alter behavior
+        # and may require pre-processing of begin/end/strides or post-processing
+        # like squeeze/expand_dims.
+        
+        return self.bb.normalize(
+            relax.op.strided_slice(data_expr, begin=begin_expr, end=end_expr, strides=strides_expr)
+        )
 
     def convert_transpose(self, subgraph, op):
         """Convert TFLite TRANSPOSE operator."""
