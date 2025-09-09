@@ -892,9 +892,9 @@ class TFLiteGraphImporter:
         result = self.bb.normalize(result)
         
         # Add bias if present
-        if len(input_tensors) == 3:
+        if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
             bias_expr = self._get_tensor_expr(input_tensors[2])
-            result = self.bb.normalize(relax.op.nn.bias_add(result, bias_expr, axis=3))
+            result = self.bb.normalize(relax.op.add(result, bias_expr))
         
         return result
 
@@ -921,7 +921,7 @@ class TFLiteGraphImporter:
         # Add bias if present
         if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
             bias_expr = self._get_tensor_expr(input_tensors[2])
-            result = self.bb.normalize(relax.op.nn.bias_add(result, bias_expr))
+            result = self.bb.normalize(relax.op.add(result, bias_expr))
         
         return result
 
@@ -1032,5 +1032,4 @@ def from_tflite(
     importer = TFLiteGraphImporter(shape_dict=_shape_dict, dtype_dict=_dtype_dict)
     mod, params = importer.from_tflite(model)
     return mod, params
-
 
