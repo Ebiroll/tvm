@@ -99,6 +99,16 @@ def to_int_list(arr):
         return [int(arr)]
 
 
+def _extract_int_value(value):
+    """Extract integer value from TVM IntImm or regular int."""
+    if hasattr(value, 'value'):
+        return int(value.value)
+    elif isinstance(value, tir.IntImm):
+        return int(value)
+    else:
+        return int(value)
+
+
 class TFLiteGraphImporter:
     """A helper class for handling Relax expression conversion from TFLite model."""
 
@@ -1142,6 +1152,10 @@ class TFLiteGraphImporter:
             )
         else:
             # For depthwise conv, we need different handling
+            # Extract the groups value as an integer
+            groups_value = data_expr.struct_info.shape[-1]
+            groups = _extract_int_value(groups_value)
+            
             result = relax.op.nn.conv2d(
                 data_expr,
                 weight_expr,
@@ -1150,9 +1164,7 @@ class TFLiteGraphImporter:
                 dilation=dilation,
                 data_layout="NHWC",
                 kernel_layout="OIHW",
-                groups=data_expr.struct_info.shape[
-                    -1
-                ],  # This needs proper group calculation for depthwise
+                groups=groups,
             )
 
         result = self.bb.normalize(result)
@@ -1203,6 +1215,7 @@ class TFLiteGraphImporter:
 
         # For now, just cast to float32 (simplified dequantization)
         return self.bb.normalize(relax.op.astype(input_expr, "float32"))
+
 
 def _decode_type(n):
     """Decode TFLite tensor type to string."""
@@ -1299,4 +1312,3 @@ def from_tflite(
     importer = TFLiteGraphImporter(shape_dict=_shape_dict, dtype_dict=_dtype_dict)
     mod, params = importer.from_tflite(model)
     return mod, params
-
