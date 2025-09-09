@@ -16,4 +16,6 @@
 # under the License.
 """Frontends for constructing Relax programs, with the model importers"""
 from . import nn
+from . import tflite
 from .common import detach_params
+from .tflite import from_tflite
