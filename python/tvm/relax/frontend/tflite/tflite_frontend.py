@@ -160,6 +160,7 @@ class TFLiteGraphImporter:
             "RELU": self.convert_relu,
             "RELU6": self.convert_relu6,
             "RESHAPE": self.convert_reshape,
+            "SHAPE": self.convert_shape,
             "SOFTMAX": self.convert_softmax,
             "SQUEEZE": self.convert_squeeze,
             "SUB": self.convert_sub,
@@ -186,8 +187,11 @@ class TFLiteGraphImporter:
                 output_var = self.bb.emit_output(outputs)
 
             # Create function
-            input_list = [var for var in self._inputs.values() if isinstance(var, relax.Var)]
-            self.bb.emit_func_output(output_var, params=input_list)
+            # The params to the main function are the model inputs and the weight parameters.
+            main_fn_params = list(self._inputs.values()) + [
+                v for k, v in self._nodes.items() if k in self._params
+            ]
+            self.bb.emit_func_output(output_var, params=main_fn_params)
 
         return self.bb.get(), self._params
 
@@ -578,12 +582,19 @@ class TFLiteGraphImporter:
         
         data_expr = self._get_tensor_expr(input_tensors[0])
 
-        # The new shape can be provided as a second input tensor or in the options
-        if len(input_tensors) == 2 and self._has_tensor_value(input_tensors[1]):
+        # The new shape can be provided as a second input tensor or in the options.
+        if len(input_tensors) == 2:
             shape_tensor = input_tensors[1]
-            new_shape = self._get_tensor_value(shape_tensor).tolist()
+            if self._has_tensor_value(shape_tensor):
+                # Shape is provided as a constant tensor.
+                new_shape = self._get_tensor_value(shape_tensor).tolist()
+                return self.bb.normalize(relax.op.reshape(data_expr, new_shape))
+            else:
+                # Shape is provided as a dynamic tensor from another operator.
+                shape_input_expr = self._get_tensor_expr(shape_tensor)
+                return self.bb.normalize(relax.op.reshape(data_expr, shape_input_expr))
         else:
-            # Get shape from operator options
+            # Shape is provided in the operator options.
             try:
                 from tflite.BuiltinOptions import BuiltinOptions
                 from tflite.ReshapeOptions import ReshapeOptions
@@ -595,8 +606,22 @@ class TFLiteGraphImporter:
             reshape_options = ReshapeOptions()
             reshape_options.Init(op_options.Bytes, op_options.Pos)
             new_shape = to_int_list(reshape_options.NewShapeAsNumpy())
+            return self.bb.normalize(relax.op.reshape(data_expr, new_shape))
 
-        return self.bb.normalize(relax.op.reshape(data_expr, new_shape))
+    def convert_shape(self, subgraph, op):
+        """Convert TFLite SHAPE operator."""
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) == 1
+        
+        input_expr = self._get_tensor_expr(input_tensors[0])
+        
+        # In Relax, shape_of returns a ShapeExpr. We need to convert it to a tensor
+        # for it to be used by other operators as a tensor input.
+        shape_expr = relax.op.shape_of(input_expr)
+        
+        # The output tensor is typically int32.
+        return self.bb.normalize(relax.op.vm.shape_to_tensor(shape_expr, "int32"))
 
     def convert_transpose(self, subgraph, op):
         """Convert TFLite TRANSPOSE operator."""
