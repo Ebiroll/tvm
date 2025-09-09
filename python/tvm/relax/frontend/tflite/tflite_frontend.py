@@ -157,6 +157,7 @@ class TFLiteGraphImporter:
             "MINIMUM": self.convert_minimum,
             "MUL": self.convert_mul,
             "NEG": self.convert_neg,
+            "PACK": self.convert_pack,
             "RELU": self.convert_relu,
             "RELU6": self.convert_relu6,
             "RESHAPE": self.convert_reshape,
@@ -624,34 +625,183 @@ class TFLiteGraphImporter:
         # The output tensor is typically int32, but we let TVM infer it.
         return self.bb.normalize(relax.op.shape_to_tensor(shape_expr))
 
-    def convert_strided_slice(self, subgraph, op):
-        """Convert TFLite STRIDED_SLICE operator."""
+    def convert_pack(self, subgraph, op):
+        """Convert TFLite PACK operator."""
         try:
             from tflite.BuiltinOptions import BuiltinOptions
-            from tflite.StridedSliceOptions import StridedSliceOptions
+            from tflite.PackOptions import PackOptions
         except ImportError:
             raise ImportError("The tflite package must be installed")
 
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
-        assert len(input_tensors) >= 3
 
-        data_expr = self._get_tensor_expr(input_tensors[0])
-        begin_expr = self._get_tensor_expr(input_tensors[1])
-        end_expr = self._get_tensor_expr(input_tensors[2])
-        
-        strides_expr = None
-        if len(input_tensors) > 3:
-            strides_expr = self._get_tensor_expr(input_tensors[3])
+        input_exprs = [self._get_tensor_expr(t) for t in input_tensors]
 
-        # TODO: Handle masks correctly. This is a simplified conversion.
-        # The masks (begin_mask, end_mask, etc.) can significantly alter behavior
-        # and may require pre-processing of begin/end/strides or post-processing
-        # like squeeze/expand_dims.
+        assert op.BuiltinOptionsType() == BuiltinOptions.PackOptions
+        op_options = op.BuiltinOptions()
+        pack_options = PackOptions()
+        pack_options.Init(op_options.Bytes, op_options.Pos)
+        axis = pack_options.Axis()
+
+        return self.bb.normalize(relax.op.stack(input_exprs, axis=axis))
+
+def convert_strided_slice(self, subgraph, op):
+    """Convert TFLite STRIDED_SLICE operator."""
+    try:
+        from tflite.BuiltinOptions import BuiltinOptions
+        from tflite.StridedSliceOptions import StridedSliceOptions
+    except ImportError:
+        raise ImportError("The tflite package must be installed")
+
+    self.current_subgraph = subgraph
+    input_tensors = self._get_input_tensors(subgraph, op)
+    assert len(input_tensors) >= 3, "strided_slice requires at least 3 inputs (data, begin, end)"
+
+    data_expr = self._get_tensor_expr(input_tensors[0])
+    
+    # Get TFLite strided slice options and masks
+    begin_mask = 0
+    end_mask = 0
+    ellipsis_mask = 0
+    new_axis_mask = 0
+    shrink_axis_mask = 0
+    
+    if op.BuiltinOptionsType() == BuiltinOptions.StridedSliceOptions:
+        op_options = op.BuiltinOptions()
+        slice_options = StridedSliceOptions()
+        slice_options.Init(op_options.Bytes, op_options.Pos)
         
-        return self.bb.normalize(
-            relax.op.strided_slice(data_expr, begin=begin_expr, end=end_expr, strides=strides_expr)
+        begin_mask = slice_options.BeginMask()
+        end_mask = slice_options.EndMask()
+        ellipsis_mask = slice_options.EllipsisMask()
+        new_axis_mask = slice_options.NewAxisMask()
+        shrink_axis_mask = slice_options.ShrinkAxisMask()
+    
+    # Extract begin values
+    begin_tensor = input_tensors[1]
+    if not self._has_tensor_value(begin_tensor):
+        raise NotImplementedError(
+            "Dynamic begin values for strided_slice are not fully supported. "
+            "The begin tensor must be a constant."
         )
+    
+    begin_values = self._get_tensor_value(begin_tensor).flatten()
+    
+    # Extract end values  
+    end_tensor = input_tensors[2]
+    if not self._has_tensor_value(end_tensor):
+        raise NotImplementedError(
+            "Dynamic end values for strided_slice are not fully supported. "
+            "The end tensor must be a constant."
+        )
+    
+    end_values = self._get_tensor_value(end_tensor).flatten()
+    
+    # Extract strides values (optional)
+    strides_values = None
+    if len(input_tensors) > 3 and input_tensors[3].tensor_idx != -1:
+        strides_tensor = input_tensors[3]
+        if self._has_tensor_value(strides_tensor):
+            strides_values = self._get_tensor_value(strides_tensor).flatten()
+        else:
+            # Default strides of 1 for all dimensions
+            strides_values = np.ones(len(begin_values), dtype=np.int32)
+    else:
+        # Default strides of 1 for all dimensions
+        strides_values = np.ones(len(begin_values), dtype=np.int32)
+    
+    # Get data shape for mask processing
+    data_shape = data_expr.struct_info.shape
+    ndim = len(data_shape)
+    
+    # Process masks to modify begin/end values
+    processed_begin = []
+    processed_end = []
+    processed_strides = []
+    axes = []
+    
+    for i in range(len(begin_values)):
+        # Handle begin_mask: if bit i is set, use 0 instead of begin[i]
+        if begin_mask & (1 << i):
+            begin_val = 0
+        else:
+            begin_val = int(begin_values[i])
+        
+        # Handle end_mask: if bit i is set, use dimension size instead of end[i]
+        if end_mask & (1 << i):
+            if i < ndim:
+                # Use the actual dimension size
+                if isinstance(data_shape[i], tir.IntImm):
+                    end_val = int(data_shape[i])
+                elif hasattr(data_shape[i], 'value'):
+                    end_val = int(data_shape[i].value)
+                else:
+                    # For symbolic shapes, we'll use a large number and rely on runtime bounds checking
+                    end_val = 2147483647  # Max int32
+            else:
+                end_val = 2147483647
+        else:
+            end_val = int(end_values[i])
+        
+        stride_val = int(strides_values[i])
+        
+        # Handle negative indices by converting to positive
+        if begin_val < 0 and i < ndim:
+            if isinstance(data_shape[i], tir.IntImm):
+                begin_val += int(data_shape[i])
+            elif hasattr(data_shape[i], 'value'):
+                begin_val += int(data_shape[i].value)
+            # For symbolic shapes, leave negative indices as-is
+        
+        if end_val < 0 and i < ndim:
+            if isinstance(data_shape[i], tir.IntImm):
+                end_val += int(data_shape[i])
+            elif hasattr(data_shape[i], 'value'):
+                end_val += int(data_shape[i].value)
+            # For symbolic shapes, leave negative indices as-is
+        
+        processed_begin.append(begin_val)
+        processed_end.append(end_val)
+        processed_strides.append(stride_val)
+        axes.append(i)
+    
+    # Warn about unsupported mask features
+    if ellipsis_mask != 0:
+        print(f"Warning: ellipsis_mask ({ellipsis_mask}) in strided_slice is not fully supported")
+    
+    if new_axis_mask != 0:
+        print(f"Warning: new_axis_mask ({new_axis_mask}) in strided_slice is not fully supported")
+    
+    # Convert to PrimValue tuples as required by Relax
+    begin_tuple = tuple(relax.PrimValue(b) for b in processed_begin)
+    end_tuple = tuple(relax.PrimValue(e) for e in processed_end)
+    strides_tuple = tuple(relax.PrimValue(s) for s in processed_strides)
+    
+    # Perform the strided slice operation
+    result = self.bb.normalize(
+        relax.op.strided_slice(
+            data_expr,
+            begin=begin_tuple,
+            end=end_tuple,
+            strides=strides_tuple,
+            axes=axes,
+            assume_inbound=False
+        )
+    )
+    
+    # Handle shrink_axis_mask: remove dimensions where the mask bit is set
+    if shrink_axis_mask != 0:
+        squeeze_axes = []
+        for i in range(len(begin_values)):
+            if shrink_axis_mask & (1 << i):
+                squeeze_axes.append(i)
+        
+        if squeeze_axes:
+            # Apply squeeze to remove the specified dimensions
+            result = self.bb.normalize(relax.op.squeeze(result, axis=squeeze_axes))
+    
+    return result
 
     def convert_transpose(self, subgraph, op):
         """Convert TFLite TRANSPOSE operator."""
