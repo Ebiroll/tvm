@@ -693,7 +693,7 @@ class TFLiteGraphImporter:
                 
                 # Choose the dtype with highest precedence
                 common_dtype = max(unique_dtypes, 
-                                key=lambda x: dtype_precedence.get(x, 0))
+                                   key=lambda x: dtype_precedence.get(x, 0))
                 
                 # Cast all inputs to common dtype
                 casted_exprs = []
@@ -1131,14 +1131,13 @@ class TFLiteGraphImporter:
             raise ValueError(f"Unsupported padding type: {padding}")
 
         # Convert weight layout from TFLite to Relax format
-        # TFLite: OHWI or 1HWO (depthwise) -> Relax: OIHW or OIHW
+        # TFLite: OHWI or 1HWO (depthwise) -> Relax: OIHW
         if conv_type == "conv2d":
             # TFLite OHWI -> Relax OIHW
             weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [0, 3, 1, 2]))
-        else:
-            # TFLite 1HWO -> Relax OIHW (need to reshape and permute)
-            # This is simplified - actual depthwise handling is more complex
-            pass
+        else: # depthwise
+            # TFLite [1, H, W, C_out] -> Relax [C_out, 1, H, W] (OIHW)
+            weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [3, 0, 1, 2]))
 
         if conv_type == "conv2d":
             result = relax.op.nn.conv2d(
