@@ -911,10 +911,12 @@ class TFLiteGraphImporter:
         if len(data_expr.struct_info.shape) > 2:
             data_expr = self.bb.normalize(relax.op.reshape(data_expr, [-1, data_expr.struct_info.shape[-1]]))
         
-        # TFLite weight layout is [out_features, in_features], need to transpose for dense
+        # TFLite weight layout is [out_features, in_features], which is W.
+        # We need to compute data @ W.T. So we transpose W.
         weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [1, 0]))
         
-        result = self.bb.normalize(relax.op.nn.dense(data_expr, weight_expr))
+        # The `dense` operator is not in relax, we use matmul.
+        result = self.bb.normalize(relax.op.matmul(data_expr, weight_expr))
         
         # Add bias if present
         if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
@@ -1030,4 +1032,5 @@ def from_tflite(
     importer = TFLiteGraphImporter(shape_dict=_shape_dict, dtype_dict=_dtype_dict)
     mod, params = importer.from_tflite(model)
     return mod, params
+
 
