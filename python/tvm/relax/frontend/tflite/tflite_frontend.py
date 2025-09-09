@@ -167,11 +167,11 @@ class TFLiteGraphImporter:
             "TRANSPOSE": self.convert_transpose,
         }
 
-    def from_tflite(self, model) -> IRModule:
+    def from_tflite(self, model) -> Tuple[IRModule, Dict[str, tvm.nd.NDArray]]:
         """Construct Relax expressions from the TFLite model."""
         # Store model reference for use in other methods
         self.current_model = model
-        
+
         with self.bb.function("main"):
             with self.bb.dataflow() as df:
                 self._parse_model_inputs(model)
@@ -189,7 +189,7 @@ class TFLiteGraphImporter:
             input_list = [var for var in self._inputs.values() if isinstance(var, relax.Var)]
             self.bb.emit_func_output(output_var, params=input_list)
 
-        return self.bb.get()
+        return self.bb.get(), self._params
 
     def _parse_model_inputs(self, model):
         """Parse model inputs and create Relax variables."""
@@ -295,7 +295,8 @@ class TFLiteGraphImporter:
 
             tensor = subgraph.Tensors(tensor_idx)
             buffer_idx = tensor.Buffer()
-            buffer = subgraph.Model().Buffers(buffer_idx) if hasattr(subgraph, 'Model') else None
+            # The `subgraph.Model()` method is not standard, so we access it from the main model
+            buffer = self.current_model.Buffers(buffer_idx) if buffer_idx < self.current_model.BuffersLength() else None
             
             # Handle quantization parameters
             qnn_params = self._parse_qnn_params(tensor)
@@ -349,9 +350,13 @@ class TFLiteGraphImporter:
         else:
             raise NotImplementedError(f"Tensor type {tensor_type} is not supported")
 
+    def _has_tensor_value(self, tensor_wrapper):
+        """Check if a tensor has a constant value."""
+        return tensor_wrapper.buffer is not None and tensor_wrapper.buffer.DataLength() > 0
+
     def _get_tensor_value(self, tensor_wrapper):
         """Get tensor buffer value from tensor wrapper."""
-        if tensor_wrapper.buffer is None:
+        if not self._has_tensor_value(tensor_wrapper):
             return None
             
         dtype = self._get_numpy_dtype(tensor_wrapper.tensor.Type())
@@ -387,14 +392,21 @@ class TFLiteGraphImporter:
     def _get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
-        
+
         if tensor_name in self._nodes:
             return self._nodes[tensor_name]
         else:
-            # Create constant
+            # Create constant and treat it as a parameter
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
             value = self._get_tensor_value(tensor_wrapper)
             dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
-            return relax.const(value, dtype)
+
+            param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
+            self._nodes[tensor_name] = param_var
+            self._params[tensor_name] = tvm.nd.array(value)
+            return param_var
 
     # Operator conversion methods
     def convert_abs(self, subgraph, op):
@@ -564,8 +576,10 @@ class TFLiteGraphImporter:
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
         
-        if len(input_tensors) == 2:
-            data_expr = self._get_tensor_expr(input_tensors[0])
+        data_expr = self._get_tensor_expr(input_tensors[0])
+
+        # The new shape can be provided as a second input tensor or in the options
+        if len(input_tensors) == 2 and self._has_tensor_value(input_tensors[1]):
             shape_tensor = input_tensors[1]
             new_shape = self._get_tensor_value(shape_tensor).tolist()
         else:
@@ -576,7 +590,6 @@ class TFLiteGraphImporter:
             except ImportError:
                 raise ImportError("The tflite package must be installed")
                 
-            data_expr = self._get_tensor_expr(input_tensors[0])
             assert op.BuiltinOptionsType() == BuiltinOptions.ReshapeOptions
             op_options = op.BuiltinOptions()
             reshape_options = ReshapeOptions()
@@ -873,7 +886,7 @@ class TFLiteGraphImporter:
                 dilation=dilation,
                 data_layout="NHWC",
                 kernel_layout="OIHW",
-                groups=1  # This needs proper group calculation for depthwise
+                groups=data_expr.struct_info.shape[-1] # This needs proper group calculation for depthwise
             )
         
         result = self.bb.normalize(result)
@@ -894,16 +907,17 @@ class TFLiteGraphImporter:
         data_expr = self._get_tensor_expr(input_tensors[0])
         weight_expr = self._get_tensor_expr(input_tensors[1])
         
-        # Flatten input data to 2D for matrix multiplication
-        data_expr = self.bb.normalize(relax.op.reshape(data_expr, [-1, data_expr.struct_info.shape[-1]]))
+        # Flatten input data to 2D for matrix multiplication if necessary
+        if len(data_expr.struct_info.shape) > 2:
+            data_expr = self.bb.normalize(relax.op.reshape(data_expr, [-1, data_expr.struct_info.shape[-1]]))
         
-        # TFLite weight layout is [out_features, in_features], need to transpose
+        # TFLite weight layout is [out_features, in_features], need to transpose for dense
         weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [1, 0]))
         
         result = self.bb.normalize(relax.op.nn.dense(data_expr, weight_expr))
         
         # Add bias if present
-        if len(input_tensors) == 3:
+        if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
             bias_expr = self._get_tensor_expr(input_tensors[2])
             result = self.bb.normalize(relax.op.nn.bias_add(result, bias_expr))
         
@@ -965,8 +979,8 @@ def _input_type(model):
 def from_tflite(
     model,
     shape_dict: Optional[Dict[str, List]] = None,
-    dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32"
-) -> IRModule:
+    dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32",
+) -> Tuple[IRModule, Dict[str, tvm.nd.NDArray]]:
     """Convert from TFLite model into compatible Relax IRModule.
 
     Parameters
@@ -984,16 +998,21 @@ def from_tflite(
     -------
     mod : tvm.IRModule
         The Relax module for compilation.
+    params : Dict[str, tvm.nd.NDArray]
+        The parameters of the model.
     """
     try:
-        import tflite
-        assert isinstance(model, (tflite.Model, getattr(tflite.Model, 'Model', type(None))))
-    except (ImportError, AttributeError, AssertionError):
-        try:
-            import tflite.Model
-            assert isinstance(model, tflite.Model.Model)
-        except (ImportError, AssertionError):
-            raise ImportError("The tflite package must be installed and model must be a tflite.Model")
+        # The tflite.Model.Model is the actual class for a model object
+        # loaded from a buffer.
+        from tflite.Model import Model as TFLiteModelClass
+    except ImportError:
+        raise ImportError("Could not import TFLite Model class. Is the tflite package installed correctly?")
+
+    if not isinstance(model, TFLiteModelClass):
+        raise TypeError(
+            "The provided model is not a valid tflite.Model.Model object. "
+            f"Expected type {TFLiteModelClass}, but got {type(model)}."
+        )
 
     _shape_dict, _dtype_dict = _input_type(model)
     if shape_dict is not None:
@@ -1009,4 +1028,6 @@ def from_tflite(
 
     # Create importer and convert
     importer = TFLiteGraphImporter(shape_dict=_shape_dict, dtype_dict=_dtype_dict)
-    return importer.from_tflite(model)
+    mod, params = importer.from_tflite(model)
+    return mod, params
+
