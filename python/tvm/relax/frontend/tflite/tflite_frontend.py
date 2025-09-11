@@ -283,6 +283,199 @@ class TFLiteGraphImporter:
         self._debug_log("Conversion complete")
         return relax_mod, np_params
     
+    def convert_resize_bilinear(self, subgraph, op):
+        """Convert TFLite RESIZE_BILINEAR operator."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.ResizeBilinearOptions import ResizeBilinearOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        self._debug_log("Converting RESIZE_BILINEAR")
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) == 2, "RESIZE_BILINEAR expects 2 inputs (data, size)"
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        size_tensor = input_tensors[1]
+        
+        input_shape = data_expr.struct_info.shape
+        self._debug_log(f"Input shape: {input_shape}")
+
+        # Get the new size from the second input tensor
+        if not self._has_tensor_value(size_tensor):
+            raise NotImplementedError(
+                "Dynamic resize size is not supported. Size tensor must be constant."
+            )
+        
+        new_size = self._get_tensor_value(size_tensor)
+        if len(new_size) != 2:
+            raise ValueError(f"Expected size tensor with 2 elements, got {len(new_size)}")
+        
+        new_height, new_width = int(new_size[0]), int(new_size[1])
+        self._debug_log(f"Target size: H={new_height}, W={new_width}")
+
+        # Get resize options
+        align_corners = False
+        half_pixel_centers = False
+        
+        if op.BuiltinOptionsType() == BuiltinOptions.ResizeBilinearOptions:
+            op_options = op.BuiltinOptions()
+            resize_options = ResizeBilinearOptions()
+            resize_options.Init(op_options.Bytes, op_options.Pos)
+            align_corners = bool(resize_options.AlignCorners())
+            half_pixel_centers = bool(resize_options.HalfPixelCenters())
+        
+        self._debug_log(f"Resize options - align_corners: {align_corners}, half_pixel_centers: {half_pixel_centers}")
+
+        # Convert to Relax resize operation
+        try:
+            # Relax resize expects (new_height, new_width) as size
+            size = [new_height, new_width]
+            
+            # Map TFLite options to Relax coordinate transformation mode
+            if half_pixel_centers:
+                coordinate_transformation_mode = "half_pixel"
+            elif align_corners:
+                coordinate_transformation_mode = "align_corners"
+            else:
+                coordinate_transformation_mode = "asymmetric"
+            
+            self._debug_log(f"Using coordinate_transformation_mode: {coordinate_transformation_mode}")
+            
+            # Use image.resize for bilinear interpolation
+            result = relax.op.image.resize2d(
+                data_expr,
+                size=size,
+                layout="NHWC",
+                method="linear",  # bilinear interpolation
+                coordinate_transformation_mode=coordinate_transformation_mode,
+            )
+            
+            self._debug_log("Created resize_bilinear operation successfully")
+            result = self.bb.normalize(result)
+            self._debug_log(f"Normalized resize operation, output shape: {result.struct_info.shape}")
+            
+            return result
+            
+        except Exception as e:
+            self._debug_log(f"ERROR in resize_bilinear operation: {e}")
+            # Fallback: try using the generic resize if image.resize2d is not available
+            try:
+                self._debug_log("Trying fallback resize method...")
+                
+                # Alternative approach using nn.upsampling
+                # Calculate scale factors
+                if len(input_shape) == 4:  # NHWC
+                    input_h = input_shape[1]
+                    input_w = input_shape[2]
+                    
+                    if isinstance(input_h, (tvm.tir.IntImm, int)) and isinstance(input_w, (tvm.tir.IntImm, int)):
+                        input_h_val = int(input_h) if hasattr(input_h, 'value') else int(input_h)
+                        input_w_val = int(input_w) if hasattr(input_w, 'value') else int(input_w)
+                        
+                        scale_h = new_height / input_h_val
+                        scale_w = new_width / input_w_val
+                        
+                        self._debug_log(f"Calculated scales: H={scale_h}, W={scale_w}")
+                        
+                        # Use upsampling with computed scales
+                        result = relax.op.nn.upsampling(
+                            data_expr,
+                            scale_h=scale_h,
+                            scale_w=scale_w,
+                            layout="NHWC",
+                            method="linear"
+                        )
+                        
+                        result = self.bb.normalize(result)
+                        self._debug_log("Fallback upsampling successful")
+                        return result
+                    else:
+                        raise ValueError("Cannot compute scales for symbolic input dimensions")
+                else:
+                    raise ValueError(f"Expected 4D input, got {len(input_shape)}D")
+                    
+            except Exception as fallback_e:
+                self._debug_log(f"Fallback method also failed: {fallback_e}")
+                raise RuntimeError(f"Both resize methods failed. Primary: {e}, Fallback: {fallback_e}")
+
+    def convert_resize_nearest_neighbor(self, subgraph, op):
+        """Convert TFLite RESIZE_NEAREST_NEIGHBOR operator."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.ResizeNearestNeighborOptions import ResizeNearestNeighborOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        self._debug_log("Converting RESIZE_NEAREST_NEIGHBOR")
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) == 2, "RESIZE_NEAREST_NEIGHBOR expects 2 inputs (data, size)"
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        size_tensor = input_tensors[1]
+        
+        input_shape = data_expr.struct_info.shape
+        self._debug_log(f"Input shape: {input_shape}")
+
+        # Get the new size from the second input tensor
+        if not self._has_tensor_value(size_tensor):
+            raise NotImplementedError(
+                "Dynamic resize size is not supported. Size tensor must be constant."
+            )
+        
+        new_size = self._get_tensor_value(size_tensor)
+        if len(new_size) != 2:
+            raise ValueError(f"Expected size tensor with 2 elements, got {len(new_size)}")
+        
+        new_height, new_width = int(new_size[0]), int(new_size[1])
+        self._debug_log(f"Target size: H={new_height}, W={new_width}")
+
+        # Get resize options
+        align_corners = False
+        half_pixel_centers = False
+        
+        if op.BuiltinOptionsType() == BuiltinOptions.ResizeNearestNeighborOptions:
+            op_options = op.BuiltinOptions()
+            resize_options = ResizeNearestNeighborOptions()
+            resize_options.Init(op_options.Bytes, op_options.Pos)
+            align_corners = bool(resize_options.AlignCorners())
+            half_pixel_centers = bool(resize_options.HalfPixelCenters())
+        
+        self._debug_log(f"Resize options - align_corners: {align_corners}, half_pixel_centers: {half_pixel_centers}")
+
+        try:
+            # Use image.resize for nearest neighbor interpolation
+            size = [new_height, new_width]
+            
+            # Map TFLite options to Relax coordinate transformation mode
+            if half_pixel_centers:
+                coordinate_transformation_mode = "half_pixel"
+            elif align_corners:
+                coordinate_transformation_mode = "align_corners"
+            else:
+                coordinate_transformation_mode = "asymmetric"
+            
+            result = relax.op.image.resize2d(
+                data_expr,
+                size=size,
+                layout="NHWC",
+                method="nearest_neighbor",
+                coordinate_transformation_mode=coordinate_transformation_mode,
+            )
+            
+            self._debug_log("Created resize_nearest_neighbor operation successfully")
+            result = self.bb.normalize(result)
+            self._debug_log(f"Normalized resize operation, output shape: {result.struct_info.shape}")
+            
+            return result
+            
+        except Exception as e:
+            self._debug_log(f"ERROR in resize_nearest_neighbor operation: {e}")
+            raise
+
+    
     def _validate_pool_params(self, data_shape, kernel_size, strides, padding):
         """Validate pool parameters before creating the operation."""
         self._debug_log("Validating pool parameters...")
@@ -728,7 +921,9 @@ class TFLiteGraphImporter:
             "PACK": self.convert_pack,
             "RELU": self.convert_relu,
             "RELU6": self.convert_relu6,
-            "RESHAPE": self.convert_reshape,
+            "RESHAPE": self.convert_reshape,            
+            "RESIZE_BILINEAR": self.convert_resize_bilinear,  
+            "RESIZE_NEAREST_NEIGHBOR": self.convert_resize_nearest_neighbor,   
             "SHAPE": self.convert_shape,
             "SOFTMAX": self.convert_softmax,
             "SQUEEZE": self.convert_squeeze,
@@ -1689,7 +1884,7 @@ class TFLiteGraphImporter:
         return self._convert_conv(subgraph, op, "depthwise")
 
     def _convert_conv(self, subgraph, op, conv_type):
-        """Generic convolution conversion."""
+        """Generic convolution conversion with proper SAME padding."""
         try:
             from tflite.BuiltinOptions import BuiltinOptions
             from tflite.Conv2DOptions import Conv2DOptions
@@ -1698,12 +1893,16 @@ class TFLiteGraphImporter:
         except ImportError:
             raise ImportError("The tflite package must be installed")
 
+        self._debug_log(f"Converting {conv_type}")
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
         assert len(input_tensors) >= 2
 
         data_expr = self._get_tensor_expr(input_tensors[0])
         weight_expr = self._get_tensor_expr(input_tensors[1])
+        
+        self._debug_log(f"Input shape: {data_expr.struct_info.shape}")
+        self._debug_log(f"Weight shape: {weight_expr.struct_info.shape}")
 
         # Get convolution options
         if conv_type == "conv2d":
@@ -1723,63 +1922,138 @@ class TFLiteGraphImporter:
         dilation_w = conv_options.DilationWFactor()
         padding = conv_options.Padding()
 
+        self._debug_log(f"Conv params - stride: [{stride_h}, {stride_w}], dilation: [{dilation_h}, {dilation_w}], padding: {padding}")
+
         strides = [stride_h, stride_w]
         dilation = [dilation_h, dilation_w]
 
-        # Handle padding
+        # Get input and kernel dimensions for SAME padding calculation
+        input_shape = data_expr.struct_info.shape
+        weight_shape = weight_expr.struct_info.shape
+        
+        if len(input_shape) == 4:  # NHWC format
+            input_h = input_shape[1]
+            input_w = input_shape[2]
+            self._debug_log(f"Input spatial dims: H={input_h}, W={input_w}")
+        else:
+            raise ValueError(f"Expected 4D input for conv2d, got {len(input_shape)}D")
+
+        # Get kernel dimensions (TFLite format depends on conv type)
+        if conv_type == "conv2d":
+            # TFLite Conv2D weight format: [out_channels, height, width, in_channels] (OHWI)
+            kernel_h = weight_shape[1] 
+            kernel_w = weight_shape[2]
+        else:  # depthwise
+            # TFLite DepthwiseConv2D weight format: [1, height, width, out_channels]
+            kernel_h = weight_shape[1]
+            kernel_w = weight_shape[2]
+        
+        self._debug_log(f"Kernel dims: H={kernel_h}, W={kernel_w}")
+
+        # Handle padding with proper SAME calculation
         if padding == Padding.VALID:
             padding_val = [0, 0, 0, 0]
+            self._debug_log("Using VALID padding: [0, 0, 0, 0]")
         elif padding == Padding.SAME:
-            # Calculate SAME padding - simplified version
-            padding_val = [0, 0, 0, 0]  # TODO: implement proper SAME padding calculation
+            # Proper SAME padding calculation for convolution
+            def calculate_conv_same_padding(input_size, kernel_size, stride, dilation):
+                """Calculate SAME padding for convolution."""
+                if isinstance(input_size, (tvm.tir.IntImm, int)):
+                    input_size_val = int(input_size) if hasattr(input_size, 'value') else int(input_size)
+                elif hasattr(input_size, 'value'):
+                    input_size_val = int(input_size.value)
+                else:
+                    # For symbolic shapes, assume reasonable default
+                    input_size_val = 224
+                    self._debug_log(f"Using default input size {input_size_val} for symbolic shape")
+                
+                if isinstance(kernel_size, (tvm.tir.IntImm, int)):
+                    kernel_size_val = int(kernel_size) if hasattr(kernel_size, 'value') else int(kernel_size)
+                elif hasattr(kernel_size, 'value'):
+                    kernel_size_val = int(kernel_size.value)
+                else:
+                    kernel_size_val = int(kernel_size)
+                
+                # Calculate effective kernel size with dilation
+                effective_kernel_size = kernel_size_val + (kernel_size_val - 1) * (dilation - 1)
+                
+                # Calculate output size (same as input for SAME padding)
+                output_size = (input_size_val + stride - 1) // stride
+                
+                # Calculate total padding needed
+                total_pad = max(0, (output_size - 1) * stride + effective_kernel_size - input_size_val)
+                pad_before = total_pad // 2
+                pad_after = total_pad - pad_before
+                
+                self._debug_log(f"SAME padding calc: input={input_size_val}, kernel={kernel_size_val}, "
+                            f"effective_kernel={effective_kernel_size}, stride={stride}, "
+                            f"total_pad={total_pad}, before={pad_before}, after={pad_after}")
+                
+                return pad_before, pad_after
+
+            pad_top, pad_bottom = calculate_conv_same_padding(input_h, kernel_h, stride_h, dilation_h)
+            pad_left, pad_right = calculate_conv_same_padding(input_w, kernel_w, stride_w, dilation_w)
+            
+            padding_val = [pad_top, pad_left, pad_bottom, pad_right]
+            self._debug_log(f"SAME padding calculated: {padding_val}")
         else:
             raise ValueError(f"Unsupported padding type: {padding}")
 
         # Convert weight layout from TFLite to Relax format
-        # TFLite: OHWI or 1HWO (depthwise) -> Relax: OIHW
         if conv_type == "conv2d":
             # TFLite OHWI -> Relax OIHW
             weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [0, 3, 1, 2]))
+            self._debug_log("Converted Conv2D weights from OHWI to OIHW")
         else: # depthwise
             # TFLite [1, H, W, C_out] -> Relax [C_out, 1, H, W] (OIHW)
             weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [3, 0, 1, 2]))
+            self._debug_log("Converted DepthwiseConv2D weights from 1HWO to OIHW")
 
-        if conv_type == "conv2d":
-            result = relax.op.nn.conv2d(
-                data_expr,
-                weight_expr,
-                strides=strides,
-                padding=padding_val,
-                dilation=dilation,
-                data_layout="NHWC",
-                kernel_layout="OIHW",
-            )
-        else:
-            # For depthwise conv, we need different handling
-            # Extract the groups value as an integer
-            groups_value = data_expr.struct_info.shape[-1]
-            groups = _extract_int_value(groups_value)
+        try:
+            if conv_type == "conv2d":
+                result = relax.op.nn.conv2d(
+                    data_expr,
+                    weight_expr,
+                    strides=strides,
+                    padding=padding_val,
+                    dilation=dilation,
+                    data_layout="NHWC",
+                    kernel_layout="OIHW",
+                )
+            else:
+                # For depthwise conv, we need the groups parameter
+                groups_value = data_expr.struct_info.shape[-1]
+                groups = _extract_int_value(groups_value)
+                
+                result = relax.op.nn.conv2d(
+                    data_expr,
+                    weight_expr,
+                    strides=strides,
+                    padding=padding_val,
+                    dilation=dilation,
+                    data_layout="NHWC",
+                    kernel_layout="OIHW",
+                    groups=groups,
+                )
+
+            self._debug_log(f"Created {conv_type} operation successfully")
+            result = self.bb.normalize(result)
+            self._debug_log(f"Normalized {conv_type} operation successfully")
+
+            # Add bias if present
+            if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
+                bias_expr = self._get_tensor_expr(input_tensors[2])
+                result = self.bb.normalize(relax.op.add(result, bias_expr))
+                self._debug_log("Added bias to convolution result")
+
+            # Log output shape for debugging
+            self._debug_log(f"Conv output shape: {result.struct_info.shape}")
+            return result
             
-            result = relax.op.nn.conv2d(
-                data_expr,
-                weight_expr,
-                strides=strides,
-                padding=padding_val,
-                dilation=dilation,
-                data_layout="NHWC",
-                kernel_layout="OIHW",
-                groups=groups,
-            )
-
-        result = self.bb.normalize(result)
-
-        # Add bias if present
-        if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
-            bias_expr = self._get_tensor_expr(input_tensors[2])
-            result = self.bb.normalize(relax.op.add(result, bias_expr))
-
-        return result
-
+        except Exception as e:
+            self._debug_log(f"ERROR in {conv_type} operation: {e}")
+            raise
+        
     def convert_fully_connected(self, subgraph, op):
         """Convert TFLite FULLY_CONNECTED operator."""
         self.current_subgraph = subgraph
