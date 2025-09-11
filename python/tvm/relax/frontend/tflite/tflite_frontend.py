@@ -125,6 +125,7 @@ class TFLiteGraphImporter:
         self._name_supply = NameSupply()
         self.bb: relax.BlockBuilder = relax.BlockBuilder()
         self._params = {}
+        self._param_vars = {}  # Add this to track parameter variables
         self._prefetched_nodes = {}
 
         # Build operator maps
@@ -141,6 +142,52 @@ class TFLiteGraphImporter:
 
         # Initialize converter map
         self._init_convert_map()
+
+    def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model."""
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        with self.bb.function("main"):
+            with self.bb.dataflow():
+                # 1) Fill inputs, nodes, params (params values should be np.ndarray)
+                self._parse_model_inputs(model)     # -> self._inputs: Dict[name, relax.Var]
+                self._convert_operators(model)      # -> self._nodes: Dict[name, relax.Expr]
+                                                    # -> self._params: Dict[name, np.ndarray]
+                                                    # -> self._param_vars: Dict[name, relax.Var]
+
+                # 2) Graph outputs
+                subgraph = model.Subgraphs(0)
+                model_outputs = subgraph.OutputsAsNumpy()
+                outs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                outs = outs[0] if len(outs) == 1 else relax.Tuple(outs)
+                out_var = self.bb.emit_output(outs)
+
+            # 3) Build function param list (real inputs + param Vars) with deterministic order
+            input_vars = list(self._inputs.values())
+            
+            param_names = sorted(self._params.keys())            # stable order by name
+            param_vars  = [self._param_vars[n] for n in param_names]
+
+            main_params = input_vars + param_vars
+            self.bb.emit_func_output(out_var, params=main_params)
+
+        # 4) Finalize and attach attrs
+        mod = self.bb.get()
+
+        # Keep returning np.ndarray to the caller…
+        np_params: Dict[str, np.ndarray] = self._params
+
+        # …but for func attrs we must pass TVM NDArrays (convert on the fly, order matches param_vars)
+        tvm_param_list = [np.array(np_params[n]) for n in param_names]
+
+        func_attrs = {
+            "num_input": len(input_vars),   # count only real model inputs
+            "params": tvm_param_list,       # serialized into metadata["ffi.Tensor"]
+        }
+        mod["main"] = mod["main"].with_attrs(func_attrs)
+
+        return mod, np_params
 
     def _init_convert_map(self):
         """Initialize the operator conversion map."""
@@ -180,32 +227,6 @@ class TFLiteGraphImporter:
             "TRANSPOSE": self.convert_transpose,
         }
 
-    def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-        """Construct Relax expressions from the TFLite model."""
-        # Store model reference for use in other methods
-        self.current_model = model
-
-        with self.bb.function("main"):
-            with self.bb.dataflow() as df:
-                self._parse_model_inputs(model)
-                self._convert_operators(model)
-
-                # Get outputs
-                subgraph = model.Subgraphs(0)
-                model_outputs = subgraph.OutputsAsNumpy()
-                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
-
-                output_var = self.bb.emit_output(outputs)
-
-            # Create function
-            # The params to the main function are the model inputs and the weight parameters.
-            main_fn_params = list(self._inputs.values()) + [
-                v for k, v in self._nodes.items() if k in self._params
-            ]
-            self.bb.emit_func_output(output_var, params=main_fn_params)
-
-        return self.bb.get(), self._params
 
     def _parse_model_inputs(self, model):
         """Parse model inputs and create Relax variables."""
@@ -426,8 +447,9 @@ class TFLiteGraphImporter:
             param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
             self._nodes[tensor_name] = param_var
             self._params[tensor_name] = np.array(value)
+            self._param_vars[tensor_name] = param_var  # Track the parameter variable
             return param_var
-
+                
     # Operator conversion methods
     def convert_abs(self, subgraph, op):
         """Convert TFLite ABS operator."""
@@ -1274,49 +1296,33 @@ def _input_type(model):
     return shape_dict, dtype_dict
 
 
-def from_tflite(self, model) -> Tuple[tvm.IRModule, Dict[str, np.ndarray]]:
-    """Construct Relax expressions from the TFLite model."""
-    self.current_model = model
 
-    with self.bb.function("main"):
-        with self.bb.dataflow():
-            # 1) Fill inputs, nodes, params (params values should be np.ndarray)
-            self._parse_model_inputs(model)     # -> self._inputs: Dict[name, relax.Var]
-            self._convert_operators(model)      # -> self._nodes: Dict[name, relax.Expr]
-                                                # -> self._params: Dict[name, np.ndarray]
-                                                # -> self._param_vars: Dict[name, relax.Var] (see note below)
-
-            # 2) Graph outputs
-            subgraph = model.Subgraphs(0)
-            model_outputs = subgraph.OutputsAsNumpy()
-            outs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-            outs = outs[0] if len(outs) == 1 else relax.Tuple(outs)
-            out_var = self.bb.emit_output(outs)
-
-        # 3) Build function param list (real inputs + param Vars) with deterministic order
-        input_vars = list(self._inputs.values())
-        if not hasattr(self, "_param_vars"):
-            raise ValueError("Expected self._param_vars mapping param names to relax.Var")
-
-        param_names = sorted(self._params.keys())            # stable order by name
-        param_vars  = [self._param_vars[n] for n in param_names]
-
-        main_params = input_vars + param_vars
-        self.bb.emit_func_output(out_var, params=main_params)
-
-    # 4) Finalize and attach attrs
-    mod = self.bb.get()
-
-    # Keep returning np.ndarray to the caller…
-    np_params: Dict[str, np.ndarray] = self._params
-
-    # …but for func attrs we must pass TVM NDArrays (convert on the fly, order matches param_vars)
-    tvm_param_list = [tvm.nd.array(np_params[n]) for n in param_names]
-
-    func_attrs = {
-        "num_input": len(input_vars),   # count only real model inputs
-        "params": tvm_param_list,       # serialized into metadata["ffi.Tensor"]
-    }
-    mod["main"] = mod["main"].with_attrs(func_attrs)
-
-    return mod, np_params
+# Update the standalone from_tflite function to use the class properly
+def from_tflite(
+    model,
+    shape_dict: Optional[Dict[str, List]] = None,
+    dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32",
+    keep_params_in_input: bool = True,
+) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+    """Construct Relax expressions from the TFLite model.
+    
+    Parameters
+    ----------
+    model : tflite.Model
+        The TFLite model to convert
+    shape_dict : Optional[Dict[str, List]]
+        Dictionary mapping input names to their shapes
+    dtype_dict : Optional[Union[str, Dict[str, str]]]
+        Dictionary mapping input names to their dtypes, or a single dtype string
+    keep_params_in_input : bool
+        Whether to keep parameters as function inputs (default: True)
+        
+    Returns
+    -------
+    mod : IRModule
+        The converted Relax module
+    params : Dict[str, np.ndarray]
+        The model parameters as numpy arrays
+    """
+    importer = TFLiteGraphImporter(shape_dict, dtype_dict, keep_params_in_input)
+    return importer.from_tflite(model)
