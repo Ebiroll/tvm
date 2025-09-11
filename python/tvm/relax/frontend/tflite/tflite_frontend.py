@@ -26,6 +26,9 @@ import tvm
 from tvm import relax, tir
 from tvm.ir import IRModule
 from tvm.ir.supply import NameSupply
+import os
+import logging
+
 
 __all__ = ["from_tflite"]
 
@@ -38,7 +41,6 @@ class TensorWrapper:
         self.tensor = tensor
         self.buffer = buffer
         self.qnn_params = qnn_params
-
 
 def get_scalar_from_constant(expr):
     """Returns scalar value from Relax constant scalar."""
@@ -116,6 +118,7 @@ class TFLiteGraphImporter:
         self,
         shape_dict: Optional[Dict[str, List]] = None,
         dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32",
+        keep_params_in_input: bool = True,
     ):
         self._nodes: Dict[str, relax.Expr] = {}
         self._inputs: Dict[str, relax.Var] = {}
@@ -124,9 +127,18 @@ class TFLiteGraphImporter:
         self._dtype = dtype_dict
         self._name_supply = NameSupply()
         self.bb: relax.BlockBuilder = relax.BlockBuilder()
-        self._params = {}
-        self._param_vars = {}  # Add this to track parameter variables
+        self._params = {}  # Store (var, value) tuples like ONNX
+        self._keep_params_in_input = keep_params_in_input
         self._prefetched_nodes = {}
+        
+        # Setup debug logging
+        self.debug_enabled = os.environ.get('TFLITE_DEBUG', '0') == '1'
+        if self.debug_enabled:
+            logging.basicConfig(level=logging.DEBUG, 
+                              format='[TFLITE_DEBUG] %(message)s')
+            self.logger = logging.getLogger(__name__)
+        else:
+            self.logger = None
 
         # Build operator maps
         try:
@@ -143,51 +155,550 @@ class TFLiteGraphImporter:
         # Initialize converter map
         self._init_convert_map()
 
+    def _debug_log(self, message):
+        """Log debug message if debugging is enabled."""
+        if self.debug_enabled and self.logger:
+            self.logger.debug(message)
+
+    def _init_convert_map(self):
+        """Initialize the operator conversion map."""
+        self.convert_map = {
+            "ABS": self.convert_abs,
+            "ADD": self.convert_add,
+            "AVERAGE_POOL_2D": self.convert_average_pool2d,
+            "CAST": self.convert_cast,
+            "CONCATENATION": self.convert_concatenation,
+            "CONV_2D": self.convert_conv2d,
+            "DEPTHWISE_CONV_2D": self.convert_depthwise_conv2d,
+            "DEQUANTIZE": self.convert_dequantize,
+            "DIV": self.convert_div,
+            "EQUAL": self.convert_equal,
+            "EXP": self.convert_exp,
+            "FULLY_CONNECTED": self.convert_fully_connected,
+            "GATHER": self.convert_gather,
+            "GREATER": self.convert_greater,
+            "LESS": self.convert_less,
+            "LOGISTIC": self.convert_logistic,
+            "MAX_POOL_2D": self.convert_max_pool2d,
+            "MAXIMUM": self.convert_maximum,
+            "MEAN": self.convert_reduce_mean,
+            "MINIMUM": self.convert_minimum,
+            "MUL": self.convert_mul,
+            "NEG": self.convert_neg,
+            "PACK": self.convert_pack,
+            "RELU": self.convert_relu,
+            "RELU6": self.convert_relu6,
+            "RESHAPE": self.convert_reshape,
+            "SHAPE": self.convert_shape,
+            "SOFTMAX": self.convert_softmax,
+            "SQUEEZE": self.convert_squeeze,
+            "STRIDED_SLICE": self.convert_strided_slice,
+            "SUB": self.convert_sub,
+            "TANH": self.convert_tanh,
+            "TRANSPOSE": self.convert_transpose,
+        }
+
+    def _get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
+
+        if tensor_name in self._nodes:
+            self._debug_log(f"Found existing node for: {tensor_name}")
+            return self._nodes[tensor_name]
+        else:
+            # Create constant and treat it as a parameter
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            self._debug_log(f"Creating parameter: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
+
+            param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
+            self._nodes[tensor_name] = param_var
+            # Store as (var, value) tuple like ONNX does - NO _param_vars reference
+            self._params[tensor_name] = (param_var, tvm.nd.array(value))
+            return param_var
+
     def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model."""
+        self._debug_log("Starting TFLite to Relax conversion")
+        
         # Store model reference for use in other methods
         self.current_model = model
 
         with self.bb.function("main"):
+            self._debug_log("Created main function")
             with self.bb.dataflow():
-                # 1) Fill inputs, nodes, params (params values should be np.ndarray)
-                self._parse_model_inputs(model)     # -> self._inputs: Dict[name, relax.Var]
-                self._convert_operators(model)      # -> self._nodes: Dict[name, relax.Expr]
-                                                    # -> self._params: Dict[name, np.ndarray]
-                                                    # -> self._param_vars: Dict[name, relax.Var]
+                self._debug_log("Starting dataflow block")
+                
+                self._parse_model_inputs(model)
+                self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+                
+                self._convert_operators(model)
+                self._debug_log(f"Converted operators, created {len(self._params)} parameters")
 
-                # 2) Graph outputs
+                # Get outputs
                 subgraph = model.Subgraphs(0)
                 model_outputs = subgraph.OutputsAsNumpy()
-                outs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                outs = outs[0] if len(outs) == 1 else relax.Tuple(outs)
-                out_var = self.bb.emit_output(outs)
+                self._debug_log(f"Model has {len(model_outputs)} outputs")
+                
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
 
-            # 3) Build function param list (real inputs + param Vars) with deterministic order
-            input_vars = list(self._inputs.values())
+                output_var = self.bb.emit_output(outputs)
+                self._debug_log("Emitted output variable")
+
+            # Create function attributes following ONNX pattern
+            func_attrs = {"num_input": self._num_input}
             
-            param_names = sorted(self._params.keys())            # stable order by name
-            param_vars  = [self._param_vars[n] for n in param_names]
+            # Create input list from actual input variables only
+            input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+            self._debug_log(f"Input list length: {len(input_list)}")
+            
+            # Attach params if they are available and keep_params_in_input is True
+            if self._keep_params_in_input and self._params:
+                param_var_list, param_value_list = map(list, zip(*self._params.values()))
+                input_list = input_list + param_var_list
+                func_attrs["params"] = param_value_list
+                self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
 
-            main_params = input_vars + param_vars
-            self.bb.emit_func_output(out_var, params=main_params)
+            self.bb.emit_func_output(output_var, params=input_list)
+            self._debug_log("Emitted function output")
 
-        # 4) Finalize and attach attrs
-        mod = self.bb.get()
+        self._debug_log("Building module")
+        relax_mod = self.bb.get()
+        
+        # Attach attributes like ONNX does
+        relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
+        self._debug_log("Attached function attributes")
+        
+        # Return numpy arrays for backward compatibility
+        np_params = {}
+        for name, (var, tvm_array) in self._params.items():
+            np_params[name] = tvm_array.numpy()
 
-        # Keep returning np.ndarray to the caller…
-        np_params: Dict[str, np.ndarray] = self._params
+        self._debug_log("Conversion complete")
+        return relax_mod, np_params
+    
+    def _validate_pool_params(self, data_shape, kernel_size, strides, padding):
+        """Validate pool parameters before creating the operation."""
+        self._debug_log("Validating pool parameters...")
+        
+        if len(data_shape) != 4:
+            raise ValueError(f"Expected 4D input, got {len(data_shape)}D: {data_shape}")
+        
+        batch, height, width, channels = data_shape
+        kernel_h, kernel_w = kernel_size
+        stride_h, stride_w = strides
+        pad_top, pad_left, pad_bottom, pad_right = padding
+        
+        # Convert symbolic dimensions to concrete values for validation
+        try:
+            h_val = int(height) if hasattr(height, 'value') else int(height)
+            w_val = int(width) if hasattr(width, 'value') else int(width)
+        except (TypeError, AttributeError):
+            self._debug_log("Symbolic dimensions detected, skipping strict validation")
+            return
+        
+        # Check for invalid parameters
+        if kernel_h <= 0 or kernel_w <= 0:
+            raise ValueError(f"Invalid kernel size: [{kernel_h}, {kernel_w}]")
+        
+        if stride_h <= 0 or stride_w <= 0:
+            raise ValueError(f"Invalid stride: [{stride_h}, {stride_w}]")
+        
+        if any(p < 0 for p in padding):
+            raise ValueError(f"Negative padding not allowed: {padding}")
+        
+        # Check if kernel is larger than input + padding
+        effective_h = h_val + pad_top + pad_bottom
+        effective_w = w_val + pad_left + pad_right
+        
+        if kernel_h > effective_h:
+            raise ValueError(f"Kernel height {kernel_h} > effective input height {effective_h}")
+        
+        if kernel_w > effective_w:
+            raise ValueError(f"Kernel width {kernel_w} > effective input width {effective_w}")
+        
+        # Calculate expected output shape
+        out_h = (effective_h - kernel_h) // stride_h + 1
+        out_w = (effective_w - kernel_w) // stride_w + 1
+        
+        self._debug_log(f"Validation passed - expected output: [{batch}, {out_h}, {out_w}, {channels}]")
 
-        # …but for func attrs we must pass TVM NDArrays (convert on the fly, order matches param_vars)
-        tvm_param_list = [np.array(np_params[n]) for n in param_names]
+    def _safe_int_extract(self, value, name="value"):
+        """Safely extract integer from TVM expressions."""
+        try:
+            if isinstance(value, int):
+                return value
+            elif hasattr(value, 'value'):
+                return int(value.value)
+            elif isinstance(value, tvm.tir.IntImm):
+                return int(value)
+            else:
+                self._debug_log(f"Could not extract {name}: {type(value)}, returning default")
+                return 224  # Safe default
+        except Exception as e:
+            self._debug_log(f"Error extracting {name}: {e}, returning default")
+            return 224
 
-        func_attrs = {
-            "num_input": len(input_vars),   # count only real model inputs
-            "params": tvm_param_list,       # serialized into metadata["ffi.Tensor"]
-        }
-        mod["main"] = mod["main"].with_attrs(func_attrs)
+    def _convert_pool2d_safe(self, subgraph, op, pool_type):
+        """Safe pool2d conversion with extensive validation."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.Padding import Padding
+            from tflite.Pool2DOptions import Pool2DOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
 
-        return mod, np_params
+        self._debug_log(f"=== SAFE Converting {pool_type}_pool2d ===")
+        self.current_subgraph = subgraph
+        
+        try:
+            input_tensors = self._get_input_tensors(subgraph, op)
+            assert len(input_tensors) == 1
+            self._debug_log("✓ Got input tensors")
+
+            data_expr = self._get_tensor_expr(input_tensors[0])
+            input_shape = data_expr.struct_info.shape
+            self._debug_log(f"✓ Input shape: {input_shape}")
+
+            # Extract pool options
+            assert op.BuiltinOptionsType() == BuiltinOptions.Pool2DOptions
+            op_options = op.BuiltinOptions()
+            pool_options = Pool2DOptions()
+            pool_options.Init(op_options.Bytes, op_options.Pos)
+
+            kernel_h = pool_options.FilterHeight()
+            kernel_w = pool_options.FilterWidth()
+            stride_h = pool_options.StrideH()
+            stride_w = pool_options.StrideW()
+            padding = pool_options.Padding()
+            
+            self._debug_log(f"✓ Raw params - kernel: [{kernel_h}, {kernel_w}], stride: [{stride_h}, {stride_w}]")
+
+            # Safe dimension extraction
+            if len(input_shape) != 4:
+                raise ValueError(f"Expected 4D input for pool2d, got {len(input_shape)}D")
+            
+            input_h = self._safe_int_extract(input_shape[1], "input_h")
+            input_w = self._safe_int_extract(input_shape[2], "input_w")
+            
+            self._debug_log(f"✓ Extracted dimensions - H: {input_h}, W: {input_w}")
+
+            # Calculate padding
+            if padding == Padding.VALID:
+                padding_val = [0, 0, 0, 0]
+                self._debug_log("✓ Using VALID padding")
+            elif padding == Padding.SAME:
+                # Safe SAME padding calculation
+                def safe_same_padding(input_size, kernel_size, stride):
+                    output_size = (input_size + stride - 1) // stride
+                    total_pad = max(0, (output_size - 1) * stride + kernel_size - input_size)
+                    pad_before = total_pad // 2
+                    pad_after = total_pad - pad_before
+                    return pad_before, pad_after
+
+                pad_top, pad_bottom = safe_same_padding(input_h, kernel_h, stride_h)
+                pad_left, pad_right = safe_same_padding(input_w, kernel_w, stride_w)
+                padding_val = [pad_top, pad_left, pad_bottom, pad_right]
+                self._debug_log(f"✓ SAME padding: {padding_val}")
+            else:
+                raise ValueError(f"Unsupported padding type: {padding}")
+
+            # Validate all parameters
+            self._validate_pool_params(input_shape, [kernel_h, kernel_w], [stride_h, stride_w], padding_val)
+
+            # Create operation with error handling
+            pool_size = [kernel_h, kernel_w]
+            strides = [stride_h, stride_w]
+            
+            self._debug_log(f"✓ Creating {pool_type}_pool2d with validated params")
+            
+            if pool_type == "avg":
+                op_func = relax.op.nn.avg_pool2d
+            elif pool_type == "max":
+                op_func = relax.op.nn.max_pool2d
+            else:
+                raise ValueError(f"Unsupported pool type: {pool_type}")
+
+            try:
+                result = op_func(
+                    data_expr,
+                    pool_size=pool_size,
+                    strides=strides,
+                    padding=padding_val,
+                    layout="NHWC",
+                )
+                self._debug_log(f"✓ Created {pool_type}_pool2d operation")
+                
+                result = self.bb.normalize(result)
+                self._debug_log(f"✓ Normalized {pool_type}_pool2d operation")
+                
+                return result
+                
+            except Exception as op_error:
+                self._debug_log(f"✗ Operation creation failed: {op_error}")
+                self._debug_log(f"  Final params: pool_size={pool_size}, strides={strides}, padding={padding_val}")
+                raise
+                
+        except Exception as e:
+            self._debug_log(f"✗ FATAL ERROR in {pool_type}_pool2d: {e}")
+            self._debug_log(f"  Exception type: {type(e)}")
+            import traceback
+            self._debug_log(f"  Traceback: {traceback.format_exc()}")
+            raise
+
+
+
+    def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model."""
+        self._debug_log("Starting TFLite to Relax conversion")
+        
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        with self.bb.function("main"):
+            self._debug_log("Created main function")
+            with self.bb.dataflow():
+                self._debug_log("Starting dataflow block")
+                
+                self._parse_model_inputs(model)
+                self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+                
+                self._convert_operators(model)
+                self._debug_log(f"Converted operators, created {len(self._params)} parameters")
+
+                # Get outputs
+                subgraph = model.Subgraphs(0)
+                model_outputs = subgraph.OutputsAsNumpy()
+                self._debug_log(f"Model has {len(model_outputs)} outputs")
+                
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+
+                output_var = self.bb.emit_output(outputs)
+                self._debug_log("Emitted output variable")
+
+            # Create function attributes following ONNX pattern
+            func_attrs = {"num_input": self._num_input}
+            
+            # Create input list from actual input variables only
+            input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+            self._debug_log(f"Input list length: {len(input_list)}")
+            
+            # Attach params if they are available and keep_params_in_input is True
+            if self._keep_params_in_input and self._params:
+                param_var_list, param_value_list = map(list, zip(*self._params.values()))
+                input_list = input_list + param_var_list
+                func_attrs["params"] = param_value_list
+                self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
+
+            self.bb.emit_func_output(output_var, params=input_list)
+            self._debug_log("Emitted function output")
+
+        self._debug_log("Building module")
+        relax_mod = self.bb.get()
+        
+        # Attach attributes like ONNX does
+        relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
+        self._debug_log("Attached function attributes")
+        
+        # Return numpy arrays for backward compatibility
+        np_params = {}
+        for name, (var, tvm_array) in self._params.items():
+            # Handle both TVM NDArray and numpy array cases
+            if hasattr(tvm_array, 'numpy'):
+                # It's a TVM NDArray, convert to numpy
+                np_params[name] = tvm_array.numpy()
+            else:
+                # It's already a numpy array
+                np_params[name] = tvm_array        
+        
+        self._debug_log("Conversion complete")
+        return relax_mod, np_params
+
+
+    # Add these methods to your TFLiteGraphImporter class
+
+    def _validate_pool_params(self, data_shape, kernel_size, strides, padding):
+        """Validate pool parameters before creating the operation."""
+        self._debug_log("Validating pool parameters...")
+        
+        if len(data_shape) != 4:
+            raise ValueError(f"Expected 4D input, got {len(data_shape)}D: {data_shape}")
+        
+        batch, height, width, channels = data_shape
+        kernel_h, kernel_w = kernel_size
+        stride_h, stride_w = strides
+        pad_top, pad_left, pad_bottom, pad_right = padding
+        
+        # Convert symbolic dimensions to concrete values for validation
+        try:
+            h_val = int(height) if hasattr(height, 'value') else int(height)
+            w_val = int(width) if hasattr(width, 'value') else int(width)
+        except (TypeError, AttributeError):
+            self._debug_log("Symbolic dimensions detected, skipping strict validation")
+            return
+        
+        # Check for invalid parameters
+        if kernel_h <= 0 or kernel_w <= 0:
+            raise ValueError(f"Invalid kernel size: [{kernel_h}, {kernel_w}]")
+        
+        if stride_h <= 0 or stride_w <= 0:
+            raise ValueError(f"Invalid stride: [{stride_h}, {stride_w}]")
+        
+        if any(p < 0 for p in padding):
+            raise ValueError(f"Negative padding not allowed: {padding}")
+        
+        # Check if kernel is larger than input + padding
+        effective_h = h_val + pad_top + pad_bottom
+        effective_w = w_val + pad_left + pad_right
+        
+        if kernel_h > effective_h:
+            raise ValueError(f"Kernel height {kernel_h} > effective input height {effective_h}")
+        
+        if kernel_w > effective_w:
+            raise ValueError(f"Kernel width {kernel_w} > effective input width {effective_w}")
+        
+        # Calculate expected output shape
+        out_h = (effective_h - kernel_h) // stride_h + 1
+        out_w = (effective_w - kernel_w) // stride_w + 1
+        
+        self._debug_log(f"Validation passed - expected output: [{batch}, {out_h}, {out_w}, {channels}]")
+
+    def _safe_int_extract(self, value, name="value"):
+        """Safely extract integer from TVM expressions."""
+        try:
+            if isinstance(value, int):
+                return value
+            elif hasattr(value, 'value'):
+                return int(value.value)
+            elif isinstance(value, tvm.tir.IntImm):
+                return int(value)
+            else:
+                self._debug_log(f"Could not extract {name}: {type(value)}, returning default")
+                return 224  # Safe default
+        except Exception as e:
+            self._debug_log(f"Error extracting {name}: {e}, returning default")
+            return 224
+
+    def _convert_pool2d_safe(self, subgraph, op, pool_type):
+        """Safe pool2d conversion with extensive validation."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.Padding import Padding
+            from tflite.Pool2DOptions import Pool2DOptions
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        self._debug_log(f"=== SAFE Converting {pool_type}_pool2d ===")
+        self.current_subgraph = subgraph
+        
+        try:
+            input_tensors = self._get_input_tensors(subgraph, op)
+            assert len(input_tensors) == 1
+            self._debug_log("✓ Got input tensors")
+
+            data_expr = self._get_tensor_expr(input_tensors[0])
+            input_shape = data_expr.struct_info.shape
+            self._debug_log(f"✓ Input shape: {input_shape}")
+
+            # Extract pool options
+            assert op.BuiltinOptionsType() == BuiltinOptions.Pool2DOptions
+            op_options = op.BuiltinOptions()
+            pool_options = Pool2DOptions()
+            pool_options.Init(op_options.Bytes, op_options.Pos)
+
+            kernel_h = pool_options.FilterHeight()
+            kernel_w = pool_options.FilterWidth()
+            stride_h = pool_options.StrideH()
+            stride_w = pool_options.StrideW()
+            padding = pool_options.Padding()
+            
+            self._debug_log(f"✓ Raw params - kernel: [{kernel_h}, {kernel_w}], stride: [{stride_h}, {stride_w}]")
+
+            # Safe dimension extraction
+            if len(input_shape) != 4:
+                raise ValueError(f"Expected 4D input for pool2d, got {len(input_shape)}D")
+            
+            input_h = self._safe_int_extract(input_shape[1], "input_h")
+            input_w = self._safe_int_extract(input_shape[2], "input_w")
+            
+            self._debug_log(f"✓ Extracted dimensions - H: {input_h}, W: {input_w}")
+
+            # Calculate padding
+            if padding == Padding.VALID:
+                padding_val = [0, 0, 0, 0]
+                self._debug_log("✓ Using VALID padding")
+            elif padding == Padding.SAME:
+                # Safe SAME padding calculation
+                def safe_same_padding(input_size, kernel_size, stride):
+                    output_size = (input_size + stride - 1) // stride
+                    total_pad = max(0, (output_size - 1) * stride + kernel_size - input_size)
+                    pad_before = total_pad // 2
+                    pad_after = total_pad - pad_before
+                    return pad_before, pad_after
+
+                pad_top, pad_bottom = safe_same_padding(input_h, kernel_h, stride_h)
+                pad_left, pad_right = safe_same_padding(input_w, kernel_w, stride_w)
+                padding_val = [pad_top, pad_left, pad_bottom, pad_right]
+                self._debug_log(f"✓ SAME padding: {padding_val}")
+            else:
+                raise ValueError(f"Unsupported padding type: {padding}")
+
+            # Validate all parameters
+            self._validate_pool_params(input_shape, [kernel_h, kernel_w], [stride_h, stride_w], padding_val)
+
+            # Create operation with error handling
+            pool_size = [kernel_h, kernel_w]
+            strides = [stride_h, stride_w]
+            
+            self._debug_log(f"✓ Creating {pool_type}_pool2d with validated params")
+            
+            if pool_type == "avg":
+                op_func = relax.op.nn.avg_pool2d
+            elif pool_type == "max":
+                op_func = relax.op.nn.max_pool2d
+            else:
+                raise ValueError(f"Unsupported pool type: {pool_type}")
+
+            try:
+                result = op_func(
+                    data_expr,
+                    pool_size=pool_size,
+                    strides=strides,
+                    padding=padding_val,
+                    layout="NHWC",
+                )
+                self._debug_log(f"✓ Created {pool_type}_pool2d operation")
+                
+                result = self.bb.normalize(result)
+                self._debug_log(f"✓ Normalized {pool_type}_pool2d operation")
+                
+                return result
+                
+            except Exception as op_error:
+                self._debug_log(f"✗ Operation creation failed: {op_error}")
+                self._debug_log(f"  Final params: pool_size={pool_size}, strides={strides}, padding={padding_val}")
+                raise
+                
+        except Exception as e:
+            self._debug_log(f"✗ FATAL ERROR in {pool_type}_pool2d: {e}")
+            self._debug_log(f"  Exception type: {type(e)}")
+            import traceback
+            self._debug_log(f"  Traceback: {traceback.format_exc()}")
+            raise
+
+    # Usage: Replace your _convert_pool2d calls with _convert_pool2d_safe
+    # self.convert_map = {
+    #     "AVERAGE_POOL_2D": lambda s, o: self._convert_pool2d_safe(s, o, "avg"),
+    #     "MAX_POOL_2D": lambda s, o: self._convert_pool2d_safe(s, o, "max"),
+    #     ...
+    # }
 
     def _init_convert_map(self):
         """Initialize the operator conversion map."""
@@ -446,8 +957,8 @@ class TFLiteGraphImporter:
 
             param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
             self._nodes[tensor_name] = param_var
-            self._params[tensor_name] = np.array(value)
-            self._param_vars[tensor_name] = param_var  # Track the parameter variable
+            # Store as (var, value) tuple like ONNX does - consistent approach
+            self._params[tensor_name] = (param_var, np.array(value))
             return param_var
                 
     # Operator conversion methods
@@ -1053,7 +1564,7 @@ class TFLiteGraphImporter:
         return self._convert_pool2d(subgraph, op, "max")
 
     def _convert_pool2d(self, subgraph, op, pool_type):
-        """Generic pool2d conversion."""
+        """Generic pool2d conversion with proper SAME padding."""
         try:
             from tflite.BuiltinOptions import BuiltinOptions
             from tflite.Padding import Padding
@@ -1061,11 +1572,13 @@ class TFLiteGraphImporter:
         except ImportError:
             raise ImportError("The tflite package must be installed")
 
+        self._debug_log(f"Converting {pool_type}_pool2d")
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
         assert len(input_tensors) == 1
 
         data_expr = self._get_tensor_expr(input_tensors[0])
+        self._debug_log(f"Input shape: {data_expr.struct_info.shape}")
 
         assert op.BuiltinOptionsType() == BuiltinOptions.Pool2DOptions
         op_options = op.BuiltinOptions()
@@ -1078,6 +1591,8 @@ class TFLiteGraphImporter:
         stride_w = pool_options.StrideW()
         padding = pool_options.Padding()
 
+        self._debug_log(f"Pool params - kernel: [{kernel_h}, {kernel_w}], stride: [{stride_h}, {stride_w}], padding: {padding}")
+
         pool_size = [kernel_h, kernel_w]
         strides = [stride_h, stride_w]
 
@@ -1086,57 +1601,83 @@ class TFLiteGraphImporter:
         if len(input_shape) == 4:  # NHWC format
             input_h = input_shape[1]
             input_w = input_shape[2]
+            self._debug_log(f"Input spatial dims: H={input_h}, W={input_w}")
         else:
             raise ValueError(f"Expected 4D input for pool2d, got {len(input_shape)}D")
 
         # Handle padding
         if padding == Padding.VALID:
             padding_val = [0, 0, 0, 0]
+            self._debug_log("Using VALID padding: [0, 0, 0, 0]")
         elif padding == Padding.SAME:
             # Calculate SAME padding properly
             def calculate_same_padding(input_size, kernel_size, stride):
                 """Calculate SAME padding for a single dimension."""
                 if isinstance(input_size, (tvm.tir.IntImm, int)):
                     input_size_val = int(input_size) if hasattr(input_size, 'value') else int(input_size)
+                elif hasattr(input_size, 'value'):
+                    input_size_val = int(input_size.value)
                 else:
                     # For symbolic shapes, assume worst case
                     input_size_val = 224  # reasonable default
+                    self._debug_log(f"Using default input size {input_size_val} for symbolic shape")
                 
                 output_size = (input_size_val + stride - 1) // stride
                 total_pad = max(0, (output_size - 1) * stride + kernel_size - input_size_val)
                 pad_before = total_pad // 2
                 pad_after = total_pad - pad_before
+                self._debug_log(f"Padding calc: input={input_size_val}, kernel={kernel_size}, stride={stride} -> total_pad={total_pad}, before={pad_before}, after={pad_after}")
                 return pad_before, pad_after
 
             pad_top, pad_bottom = calculate_same_padding(input_h, kernel_h, stride_h)
             pad_left, pad_right = calculate_same_padding(input_w, kernel_w, stride_w)
             
             padding_val = [pad_top, pad_left, pad_bottom, pad_right]
+            self._debug_log(f"SAME padding calculated: {padding_val}")
         else:
             raise ValueError(f"Unsupported padding type: {padding}")
 
-        if pool_type == "avg":
-            return self.bb.normalize(
-                relax.op.nn.avg_pool2d(
+        self._debug_log(f"Final pool params - size: {pool_size}, strides: {strides}, padding: {padding_val}")
+
+        try:
+            if pool_type == "avg":
+                result = relax.op.nn.avg_pool2d(
                     data_expr,
                     pool_size=pool_size,
                     strides=strides,
                     padding=padding_val,
                     layout="NHWC",
                 )
-            )
-        elif pool_type == "max":
-            return self.bb.normalize(
-                relax.op.nn.max_pool2d(
+            elif pool_type == "max":
+                result = relax.op.nn.max_pool2d(
                     data_expr,
                     pool_size=pool_size,
                     strides=strides,
                     padding=padding_val,
                     layout="NHWC",
                 )
-            )
-        else:
-            raise ValueError(f"Unsupported pool type: {pool_type}")
+            else:
+                raise ValueError(f"Unsupported pool type: {pool_type}")
+            
+            self._debug_log(f"Created {pool_type}_pool2d operation successfully")
+            result = self.bb.normalize(result)
+            self._debug_log(f"Normalized {pool_type}_pool2d operation successfully")
+            return result
+            
+        except Exception as e:
+            self._debug_log(f"ERROR in {pool_type}_pool2d operation: {e}")
+            self._debug_log(f"  data_expr type: {type(data_expr)}")
+            self._debug_log(f"  data_expr struct_info: {data_expr.struct_info}")
+            raise
+
+    # Pool operators
+    def convert_average_pool2d(self, subgraph, op):
+        """Convert TFLite AVERAGE_POOL_2D operator."""
+        return self._convert_pool2d(subgraph, op, "avg")
+
+    def convert_max_pool2d(self, subgraph, op):
+        """Convert TFLite MAX_POOL_2D operator."""
+        return self._convert_pool2d(subgraph, op, "max")
         
     # Convolution operators
     def convert_conv2d(self, subgraph, op):
@@ -1322,7 +1863,6 @@ def _input_type(model):
 
 
 
-# Update the standalone from_tflite function to use the class properly
 def from_tflite(
     model,
     shape_dict: Optional[Dict[str, List]] = None,
