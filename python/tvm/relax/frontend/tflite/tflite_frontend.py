@@ -971,36 +971,53 @@ class TFLiteGraphImporter:
         return self.bb.normalize(relax.op.astype(input_expr, output_dtype))
 
     def convert_reduce_mean(self, subgraph, op):
-        """Convert TFLite MEAN operator."""
-        try:
-            from tflite.BuiltinOptions import BuiltinOptions
-            from tflite.ReducerOptions import ReducerOptions
-        except ImportError:
-            raise ImportError("The tflite package must be installed")
+        from tflite.BuiltinOptions import BuiltinOptions
+        from tflite.ReducerOptions import ReducerOptions
 
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
         assert len(input_tensors) == 2
 
         data_expr = self._get_tensor_expr(input_tensors[0])
+        data_sinfo = data_expr.struct_info   # ✅ not relax.analysis.get_static_type
+        rank = len(getattr(data_sinfo, "shape", [])) if hasattr(data_sinfo, "shape") else None
 
-        # Handle axes tensor
+        # Parse axes tensor (2nd input)
         axes_tensor = input_tensors[1]
+        axes = None
         if self._has_tensor_value(axes_tensor):
-            axes_value = self._get_tensor_value(axes_tensor)
+            axes_value = self._get_tensor_value(axes_tensor)  # numpy array or None
             if axes_value is not None:
-                axes = tuple(axes_value.tolist()) if axes_value.size > 0 else None
-            else:
-                axes = None  # Use default behavior
-        else:
-            axes = None  # Use default behavior for dynamic case
+                axes_list = axes_value.tolist()
+                if len(axes_list) == 0:
+                    axes = []  # explicit empty => no-op reduction
+                else:
+                    # normalize negatives and dedup
+                    if rank is not None:
+                        norm = []
+                        for a in axes_list:
+                            a = int(a)
+                            if a < 0:
+                                a += rank
+                            norm.append(a)
+                        axes = sorted(set(norm))
+                    else:
+                        # fallback: pass as-is; Relax will handle at runtime
+                        axes = tuple(int(a) for a in axes_list)
 
+        # KeepDims from ReducerOptions
         keepdims = False
         if op.BuiltinOptionsType() == BuiltinOptions.ReducerOptions:
-            op_options = op.BuiltinOptions()
-            reducer_options = ReducerOptions()
-            reducer_options.Init(op_options.Bytes, op_options.Pos)
-            keepdims = reducer_options.KeepDims()
+            opts = op.BuiltinOptions()
+            ro = ReducerOptions()
+            ro.Init(opts.Bytes, opts.Pos)
+            keepdims = bool(ro.KeepDims())
+
+        # Decide axis argument:
+        # - axes == None  -> reduce all dims (TF default when axes missing)
+        # - axes == []    -> no-op reduction (identity), so just return data_expr
+        if axes == []:
+            return data_expr  # identity, regardless of keepdims
 
         return self.bb.normalize(relax.op.mean(data_expr, axis=axes, keepdims=keepdims))
 
@@ -1257,57 +1274,49 @@ def _input_type(model):
     return shape_dict, dtype_dict
 
 
-def from_tflite(
-    model,
-    shape_dict: Optional[Dict[str, List]] = None,
-    dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32",
-) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-    """Convert from TFLite model into compatible Relax IRModule.
+def from_tflite(self, model) -> Tuple[tvm.IRModule, Dict[str, np.ndarray]]:
+    """Construct Relax expressions from the TFLite model."""
+    self.current_model = model
 
-    Parameters
-    ----------
-    model : tflite.Model
-        The TFLite model to convert.
+    with self.bb.function("main"):
+        with self.bb.dataflow():
+            # 1) Fill inputs, nodes, params (params values should be np.ndarray)
+            self._parse_model_inputs(model)     # -> self._inputs: Dict[name, relax.Var]
+            self._convert_operators(model)      # -> self._nodes: Dict[name, relax.Expr]
+                                                # -> self._params: Dict[name, np.ndarray]
+                                                # -> self._param_vars: Dict[name, relax.Var] (see note below)
 
-    shape_dict : dict of str to list/tuple, optional
-        Input shapes of the model.
+            # 2) Graph outputs
+            subgraph = model.Subgraphs(0)
+            model_outputs = subgraph.OutputsAsNumpy()
+            outs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+            outs = outs[0] if len(outs) == 1 else relax.Tuple(outs)
+            out_var = self.bb.emit_output(outs)
 
-    dtype_dict : str or dict of str to str, optional
-        Input types of the model.
+        # 3) Build function param list (real inputs + param Vars) with deterministic order
+        input_vars = list(self._inputs.values())
+        if not hasattr(self, "_param_vars"):
+            raise ValueError("Expected self._param_vars mapping param names to relax.Var")
 
-    Returns
-    -------
-    mod : tvm.IRModule
-        The Relax module for compilation.
-    params : Dict[str, tvm.nd.NDArray]
-        The parameters of the model.
-    """
-    try:
-        # The tflite.Model.Model is the actual class for a model object
-        # loaded from a buffer.
-        from tflite.Model import Model as TFLiteModelClass
-    except ImportError:
-        raise ImportError("Could not import TFLite Model class. Is the tflite package installed correctly?")
+        param_names = sorted(self._params.keys())            # stable order by name
+        param_vars  = [self._param_vars[n] for n in param_names]
 
-    if not isinstance(model, TFLiteModelClass):
-        raise TypeError(
-            "The provided model is not a valid tflite.Model.Model object. "
-            f"Expected type {TFLiteModelClass}, but got {type(model)}."
-        )
+        main_params = input_vars + param_vars
+        self.bb.emit_func_output(out_var, params=main_params)
 
-    _shape_dict, _dtype_dict = _input_type(model)
-    if shape_dict is not None:
-        _shape_dict.update(shape_dict)
-    if dtype_dict is not None:
-        if isinstance(dtype_dict, str):
-            _dtype_dict = {k: dtype_dict for k in _dtype_dict.keys()}
-        else:
-            _dtype_dict.update(dtype_dict)
+    # 4) Finalize and attach attrs
+    mod = self.bb.get()
 
-    # Only support single subgraph for now
-    assert model.SubgraphsLength() == 1, "Only single subgraph models are supported"
+    # Keep returning np.ndarray to the caller…
+    np_params: Dict[str, np.ndarray] = self._params
 
-    # Create importer and convert
-    importer = TFLiteGraphImporter(shape_dict=_shape_dict, dtype_dict=_dtype_dict)
-    mod, params = importer.from_tflite(model)
-    return mod, params
+    # …but for func attrs we must pass TVM NDArrays (convert on the fly, order matches param_vars)
+    tvm_param_list = [tvm.nd.array(np_params[n]) for n in param_names]
+
+    func_attrs = {
+        "num_input": len(input_vars),   # count only real model inputs
+        "params": tvm_param_list,       # serialized into metadata["ffi.Tensor"]
+    }
+    mod["main"] = mod["main"].with_attrs(func_attrs)
+
+    return mod, np_params
