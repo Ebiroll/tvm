@@ -1081,12 +1081,37 @@ class TFLiteGraphImporter:
         pool_size = [kernel_h, kernel_w]
         strides = [stride_h, stride_w]
 
+        # Get input shape for SAME padding calculation
+        input_shape = data_expr.struct_info.shape
+        if len(input_shape) == 4:  # NHWC format
+            input_h = input_shape[1]
+            input_w = input_shape[2]
+        else:
+            raise ValueError(f"Expected 4D input for pool2d, got {len(input_shape)}D")
+
         # Handle padding
         if padding == Padding.VALID:
             padding_val = [0, 0, 0, 0]
         elif padding == Padding.SAME:
-            # Calculate SAME padding - simplified version
-            padding_val = [0, 0, 0, 0]  # TODO: implement proper SAME padding calculation
+            # Calculate SAME padding properly
+            def calculate_same_padding(input_size, kernel_size, stride):
+                """Calculate SAME padding for a single dimension."""
+                if isinstance(input_size, (tvm.tir.IntImm, int)):
+                    input_size_val = int(input_size) if hasattr(input_size, 'value') else int(input_size)
+                else:
+                    # For symbolic shapes, assume worst case
+                    input_size_val = 224  # reasonable default
+                
+                output_size = (input_size_val + stride - 1) // stride
+                total_pad = max(0, (output_size - 1) * stride + kernel_size - input_size_val)
+                pad_before = total_pad // 2
+                pad_after = total_pad - pad_before
+                return pad_before, pad_after
+
+            pad_top, pad_bottom = calculate_same_padding(input_h, kernel_h, stride_h)
+            pad_left, pad_right = calculate_same_padding(input_w, kernel_w, stride_w)
+            
+            padding_val = [pad_top, pad_left, pad_bottom, pad_right]
         else:
             raise ValueError(f"Unsupported padding type: {padding}")
 
@@ -1112,7 +1137,7 @@ class TFLiteGraphImporter:
             )
         else:
             raise ValueError(f"Unsupported pool type: {pool_type}")
-
+        
     # Convolution operators
     def convert_conv2d(self, subgraph, op):
         """Convert TFLite CONV_2D operator."""
