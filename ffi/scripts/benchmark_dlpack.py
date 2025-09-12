@@ -44,11 +44,11 @@ import time
 
 
 def print_speed(name, speed):
-    print(f"{name:<40} {speed} sec/call")
+    print(f"{name:<60} {speed} sec/call")
 
 
 def print_error(name, error):
-    print(f"{name:<40} {error}")
+    print(f"{name:<60} {error}")
 
 
 def baseline_torch_add(repeat):
@@ -122,7 +122,7 @@ def tvm_ffi_nop(repeat):
     nop(x, y, z)
     start = time.time()
     for i in range(repeat):
-        y = tvm_ffi.from_dlpack(x)
+        nop(x, y, z)
     end = time.time()
     print_speed("tvm_ffi.nop", (end - start) / repeat)
 
@@ -237,6 +237,7 @@ def bench_tvm_ffi_nop_autodlpack(name, x, y, z, repeat):
     """
     nop = tvm_ffi.get_global_func("testing.nop")
     nop(x, y, z)
+    eps = 1e-6
     start = time.time()
     for i in range(repeat):
         nop(x, y, z)
@@ -273,6 +274,22 @@ def tvm_ffi_nop_autodlpack_from_numpy(repeat):
     y = np.arange(256)
     z = np.arange(256)
     bench_tvm_ffi_nop_autodlpack("tvm_ffi.nop.autodlpack(numpy)", x, y, z, repeat)
+
+
+def tvm_ffi_nop_autodlpack_from_dltensor_test_wrapper(repeat, device):
+    """
+    Measures overhead of running dlpack via auto convert by directly
+    take test wrapper as inputs. This effectively measure DLPack exchange in tvm ffi.
+    """
+    x = tvm_ffi.from_dlpack(torch.arange(1, device=device))
+    y = tvm_ffi.from_dlpack(torch.arange(1, device=device))
+    z = tvm_ffi.from_dlpack(torch.arange(1, device=device))
+    x = tvm_ffi.core.DLTensorTestWrapper(x)
+    y = tvm_ffi.core.DLTensorTestWrapper(y)
+    z = tvm_ffi.core.DLTensorTestWrapper(z)
+    bench_tvm_ffi_nop_autodlpack(
+        f"tvm_ffi.nop.autodlpack(DLTensorTestWrapper[{device}])", x, y, z, repeat
+    )
 
 
 def bench_to_dlpack(x, name, repeat):
@@ -359,15 +376,25 @@ def bench_torch_get_current_stream(repeat, name, func):
     print_speed(f"torch.cuda.current_stream[{name}]", speed)
 
 
+def populate_object_table(num_classes):
+    nop = tvm_ffi.get_global_func("testing.nop")
+    dummy_instances = [type(f"DummyClass{i}", (object,), {})() for i in range(num_classes)]
+    for instance in dummy_instances:
+        nop(instance)
+
+
 def main():
     repeat = 10000
+    # measures impact of object dispatch table size
+    # takeaway so far is that there is no impact on the performance
+    num_classes = 0
+    populate_object_table(num_classes)
     print("-----------------------------")
     print("Benchmark f(x, y, z) overhead")
     print("-----------------------------")
     baseline_numpy_add(repeat)
     baseline_torch_add(repeat)
     baseline_cupy_add(repeat)
-    tvm_ffi_nop(repeat)
     tvm_ffi_nop_from_torch_dlpack(repeat)
     tvm_ffi_nop_from_numpy_dlpack(repeat)
     tvm_ffi_self_dlpack_nop(repeat)
@@ -377,6 +404,9 @@ def main():
     tvm_ffi_nop_autodlpack_from_torch(repeat, "cuda", stream=True)
 
     tvm_ffi_nop_autodlpack_from_numpy(repeat)
+    tvm_ffi_nop_autodlpack_from_dltensor_test_wrapper(repeat, "cpu")
+    tvm_ffi_nop_autodlpack_from_dltensor_test_wrapper(repeat, "cuda")
+    tvm_ffi_nop(repeat)
     print("-------------------------------")
     print("Benchmark x.__dlpack__ overhead")
     print("-------------------------------")
@@ -405,6 +435,10 @@ def main():
             repeat, "cpp-extension", load_torch_get_current_cuda_stream()
         )
         bench_torch_get_current_stream(repeat, "python", torch_get_cuda_stream_native)
+    print("---------------------------------------------------")
+    print("Benchmark tvm_ffi.print_helper_info")
+    print("---------------------------------------------------")
+    tvm_ffi.core._print_debug_info()
 
 
 if __name__ == "__main__":

@@ -24,6 +24,59 @@ from cpython cimport PyErr_CheckSignals, PyGILState_Ensure, PyGILState_Release, 
 from cpython cimport pycapsule, PyCapsule_Destructor
 from cpython cimport PyErr_SetNone
 
+cdef extern from "dlpack/dlpack.h":
+    cdef enum:
+        kDLCPU = 1,
+        kDLCUDA = 2,
+        kDLCUDAHost = 3,
+        kDLOpenCL = 4,
+        kDLVulkan = 7,
+        kDLMetal = 8,
+        kDLVPI = 9,
+        kDLROCM = 10,
+        kDLROCMHost = 11,
+        kDLExtDev = 12,
+        kDLCUDAManaged = 13,
+        kDLOneAPI = 14,
+        kDLWebGPU = 15,
+        kDLHexagon = 16,
+        kDLMAIA = 17
+        kDLTrn = 18
+
+    ctypedef struct DLDataType:
+        uint8_t code
+        uint8_t bits
+        int16_t lanes
+
+    ctypedef struct DLDevice:
+        int device_type
+        int device_id
+
+    ctypedef struct DLTensor:
+        void* data
+        DLDevice device
+        int ndim
+        DLDataType dtype
+        int64_t* shape
+        int64_t* strides
+        uint64_t byte_offset
+
+    ctypedef struct DLPackVersion:
+        uint32_t major
+        uint32_t minor
+
+    ctypedef struct DLManagedTensor:
+        DLTensor dl_tensor
+        void* manager_ctx
+        void (*deleter)(DLManagedTensor* self)
+
+    ctypedef struct DLManagedTensorVersioned:
+        DLPackVersion version
+        DLTensor dl_tensor
+        void* manager_ctx
+        void (*deleter)(DLManagedTensorVersioned* self)
+        uint64_t flags
+
 
 # Cython binding for TVM FFI C API
 cdef extern from "tvm/ffi/c_api.h":
@@ -57,40 +110,6 @@ cdef extern from "tvm/ffi/c_api.h":
 
 
     ctypedef void* TVMFFIObjectHandle
-
-    ctypedef struct DLDataType:
-        uint8_t code
-        uint8_t bits
-        int16_t lanes
-
-    ctypedef struct DLDevice:
-        int device_type
-        int device_id
-
-    ctypedef struct DLTensor:
-        void* data
-        DLDevice device
-        int ndim
-        DLDataType dtype
-        int64_t* shape
-        int64_t* strides
-        uint64_t byte_offset
-
-    ctypedef struct DLPackVersion:
-        uint32_t major
-        uint32_t minor
-
-    ctypedef struct DLManagedTensor:
-        DLTensor dl_tensor
-        void* manager_ctx
-        void (*deleter)(DLManagedTensor* self)
-
-    ctypedef struct DLManagedTensorVersioned:
-        DLPackVersion version
-        DLManagedTensor dl_tensor
-        void* manager_ctx
-        void (*deleter)(DLManagedTensorVersioned* self)
-        uint64_t flags
 
     ctypedef struct TVMFFIObject:
         int32_t type_index
@@ -176,6 +195,7 @@ cdef extern from "tvm/ffi/c_api.h":
         const TVMFFITypeMetadata* metadata
 
     int TVMFFIObjectDecRef(TVMFFIObjectHandle obj) nogil
+    int TVMFFIObjectIncRef(TVMFFIObjectHandle obj) nogil
     int TVMFFIObjectCreateOpaque(void* handle, int32_t type_index,
                                  void (*deleter)(void*), TVMFFIObjectHandle* out) nogil
     int TVMFFIObjectGetTypeIndex(TVMFFIObjectHandle obj) nogil
@@ -219,9 +239,61 @@ cdef extern from "tvm/ffi/extra/c_env_api.h":
 
     int TVMFFIEnvRegisterCAPI(const char* name, void* ptr) nogil
     void* TVMFFIEnvGetCurrentStream(int32_t device_type, int32_t device_id) nogil
-    int TVMFFIEnvSetStream(int32_t device_type, int32_t device_id,
-                           TVMFFIStreamHandle stream,
-                           TVMFFIStreamHandle* opt_out_original_stream) nogil
+    int TVMFFIEnvSetCurrentStream(int32_t device_type, int32_t device_id,
+                                  TVMFFIStreamHandle stream,
+                                  TVMFFIStreamHandle* opt_out_original_stream) nogil
+
+
+cdef extern from "tvm_ffi_python_helpers.h":
+    # no need to expose fields of the call context
+    ctypedef struct TVMFFIPyCallContext:
+        int device_type
+        int device_id
+        TVMFFIStreamHandle stream
+
+     # setter data structure
+    ctypedef int (*DLPackPyObjectCExporter)(
+        void* py_obj, DLManagedTensorVersioned** out, TVMFFIStreamHandle* env_stream
+    ) except -1
+
+    ctypedef struct TVMFFIPyArgSetter:
+        int (*func)(TVMFFIPyArgSetter* handle, TVMFFIPyCallContext* ctx,  PyObject* py_arg, TVMFFIAny* out) except -1
+        DLPackPyObjectCExporter dlpack_c_exporter
+
+    ctypedef int (*TVMFFIPyArgSetterFactory)(PyObject* value, TVMFFIPyArgSetter* out) except -1
+    # The main call function
+    int TVMFFIPyFuncCall(
+        TVMFFIPyArgSetterFactory setter_factory,
+        void* chandle,
+        PyObject* py_arg_tuple,
+        TVMFFIAny* result,
+        int* c_api_ret_code
+    ) except -1
+
+    int TVMFFIPyCallFieldSetter(
+        TVMFFIPyArgSetterFactory setter_factory,
+        TVMFFIFieldSetter field_setter,
+        void* field_ptr,
+        PyObject* py_arg,
+        int* c_api_ret_code
+    ) except -1
+
+    int TVMFFIPyPyObjectToFFIAny(
+        TVMFFIPyArgSetterFactory setter_factory,
+        PyObject* py_arg,
+        TVMFFIAny* out,
+        int* c_api_ret_code
+    ) except -1
+
+    size_t TVMFFIPyGetDispatchMapSize() noexcept
+
+    void TVMFFIPyPushTempFFIObject(TVMFFIPyCallContext* ctx, TVMFFIObjectHandle arg) noexcept
+    void TVMFFIPyPushTempPyObject(TVMFFIPyCallContext* ctx, PyObject* arg) noexcept
+    # the predefined setters for common POD types
+    int TVMFFIPyArgSetterFloat_(TVMFFIPyArgSetter*, TVMFFIPyCallContext*, PyObject* arg, TVMFFIAny* out) except -1
+    int TVMFFIPyArgSetterInt_(TVMFFIPyArgSetter*, TVMFFIPyCallContext*, PyObject* arg, TVMFFIAny* out) except -1
+    int TVMFFIPyArgSetterBool_(TVMFFIPyArgSetter*, TVMFFIPyCallContext*, PyObject* arg, TVMFFIAny* out) except -1
+    int TVMFFIPyArgSetterNone_(TVMFFIPyArgSetter*, TVMFFIPyCallContext*, PyObject* arg, TVMFFIAny* out) except -1
 
 
 cdef class ByteArrayArg:
