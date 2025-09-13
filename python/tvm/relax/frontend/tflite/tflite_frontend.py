@@ -624,11 +624,30 @@ class TFLiteGraphImporter:
                 model_outputs = subgraph.OutputsAsNumpy()
                 self._debug_log(f"Model has {len(model_outputs)} outputs")
                 
-                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+                # old version
+                #outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                #outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
 
-                output_var = self.bb.emit_output(outputs)
-                self._debug_log("Emitted output variable")
+                #output_var = self.bb.emit_output(outputs)
+                #self._debug_log("Emitted output variable")
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+    
+                # CRITICAL FIX: Make ALL outputs contiguous (even passthrough inputs)
+                def ensure_contiguous(tensor_expr):
+                    """Force contiguous layout using flatten-reshape."""
+                    original_shape = tensor_expr.struct_info.shape
+                    flattened = self.bb.normalize(relax.op.reshape(tensor_expr, [-1]))
+                    contiguous = self.bb.normalize(relax.op.reshape(flattened, original_shape))
+                    return contiguous
+                
+                contiguous_outputs = []
+                for i, output in enumerate(outputs):
+                    self._debug_log(f"Making output {i} contiguous")
+                    contiguous_output = ensure_contiguous(output)
+                    contiguous_outputs.append(contiguous_output)
+                
+                final_outputs = contiguous_outputs[0] if len(contiguous_outputs) == 1 else relax.Tuple(contiguous_outputs)
+                output_var = self.bb.emit_output(final_outputs)
 
             # emit_func_output without additional params since they're already in function signature
             self.bb.emit_func_output(output_var)
@@ -651,6 +670,8 @@ class TFLiteGraphImporter:
         self._debug_log("Conversion complete")
         print(f"Function created with {len(input_list)} input parameters")
         return relax_mod, {}
+    
+
     def long_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model - Corrected TVM pattern."""
         self._debug_log("Starting TFLite to Relax conversion")
@@ -1744,27 +1765,45 @@ class TFLiteGraphImporter:
         return result
 
     def convert_transpose(self, subgraph, op):
-        """Convert TFLite TRANSPOSE operator - Reshape-based contiguity fix."""
+        """
+        Convert the TFLite TRANSPOSE operator to a Relax permute_dims operator,
+        ensuring the output is contiguous for the runtime.
+        """
         self.current_subgraph = subgraph
+        
+        # Get the input tensors: the data and the permutation axes.
         input_tensors = self._get_input_tensors(subgraph, op)
-        assert len(input_tensors) == 2
+        assert len(input_tensors) == 2, "TRANSPOSE operator expects 2 inputs: data and permutation."
 
         data_expr = self._get_tensor_expr(input_tensors[0])
-        perm = self._get_tensor_value(input_tensors[1])
-        if perm is not None:
-            perm = tuple(perm.tolist())
+        
+        perm_values = self._get_tensor_value(input_tensors[1])
+        if perm_values is None:
+            raise ValueError(
+                "Dynamic (non-constant) permutation axes for the TRANSPOSE operator are not supported."
+            )
 
-        # Perform transpose
-        result = self.bb.normalize(relax.op.permute_dims(data_expr, perm))
+        axes = tuple(perm_values.tolist())
         
-        # STRONGER FIX: Force contiguity with reshape (same shape)
-        result_shape = result.struct_info.shape
-        result = self.bb.normalize(relax.op.reshape(result, result_shape))
+        # 1. Perform the transpose. The result is potentially non-contiguous.
+        permuted_expr = self.bb.normalize(relax.op.permute_dims(data_expr, axes=axes))
         
-        self._debug_log(f"Transpose + reshape: {data_expr.struct_info.shape} -> {result.struct_info.shape}")
+        # 2. FIX: Force a contiguous layout using a flatten-and-reshape trick.
+        # A simple reshape(x, x.shape) can be optimized away. By first reshaping
+        # to a 1D tensor and then back to the target shape, we force the compiler
+        # to create a new, contiguous tensor in memory.
+        original_shape = permuted_expr.struct_info.shape
+        flattened_expr = self.bb.normalize(relax.op.reshape(permuted_expr, [-1]))
+        contiguous_result = self.bb.normalize(relax.op.reshape(flattened_expr, original_shape))
+
+        self._debug_log(
+            f"Transpose (via reshape flatten): {data_expr.struct_info.shape} -> {contiguous_result.struct_info.shape}"
+        )
         
-        return result
-    
+        return contiguous_result
+
+
+     
     def convert_squeeze(self, subgraph, op):
         """Convert TFLite SQUEEZE operator."""
         try:
