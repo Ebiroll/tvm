@@ -80,16 +80,48 @@ def get_pad_value(data, kernel, stride):
     pad_after = pad - pad_before
     return pad_before, pad_after
 
+def debug_ir_variables(mod):
+    """Debug function to print all variables in the IR module."""
+    print("\n=== Debugging IR Variables ===")
+    
+    try:
+        main_func = mod["main"]
+        print(f"Function parameters ({len(main_func.params)}):")
+        for i, param in enumerate(main_func.params):
+            print(f"  {i}: {param.name_hint} (struct_info: {param.struct_info})")
+        
+        # Try to find all variable references in the function body
+        print(f"\nAnalyzing function body...")
+        
+        # Print the IR for inspection
+        print(f"\nFull IR for inspection:")
+        print(main_func.script(show_meta=True))
+        
+    except Exception as e:
+        print(f"Error during IR analysis: {e}")
+
+def sanitize_tensor_name(name):
+    """Sanitize tensor names to be valid TVM variable names."""
+    # Replace problematic characters with underscores
+    sanitized = name.replace(".", "_").replace("/", "_").replace(":", "_")
+    # Remove any double underscores
+    while "__" in sanitized:
+        sanitized = sanitized.replace("__", "_")
+    # Ensure it doesn't start with a number
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "tensor_" + sanitized
+    return sanitized
 
 def get_tensor_name(subgraph, tensor_idx):
-    """Get the tensor name."""
+    """Get the tensor name - FIXED for consistent naming."""
     tensor_name = subgraph.Tensors(tensor_idx).Name()
     if tensor_name is not None:
         tensor_name = tensor_name.decode("utf-8")
     else:
         tensor_name = "tvmgen_tensor_" + str(tensor_idx)
-    return tensor_name
-
+    
+    # CRITICAL: Apply consistent name sanitization
+    return sanitize_tensor_name(tensor_name)
 
 def to_int_list(arr):
     """Convert numpy array or list to python int list"""
@@ -562,6 +594,86 @@ class TFLiteGraphImporter:
             raise
 
     def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model - Corrected TVM pattern."""
+        self._debug_log("Starting TFLite to Relax conversion")
+        
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        # First, prepare all inputs and parameters outside the function scope
+        self._parse_model_inputs(model)
+        self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+        
+        # Create function signature with all variables
+        func_attrs = {"num_input": self._num_input}
+        input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+        
+        # Handle parameters following ONNX pattern  
+        if self._keep_params_in_input and self._params:
+            param_var_list, param_value_list = map(list, zip(*self._params.values()))
+            
+            # Ensure all arrays are writable
+            writable_param_list = []
+            for param_array in param_value_list:
+                if hasattr(param_array, 'flags') and not param_array.flags.writeable:
+                    writable_array = np.array(param_array, copy=True)
+                    writable_param_list.append(writable_array)
+                else:
+                    writable_param_list.append(param_array)
+            
+            input_list = input_list + param_var_list
+            func_attrs["params"] = writable_param_list
+            self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
+
+        # CRITICAL: Pass parameters to function signature, not to emit_func_output
+        with self.bb.function("main", input_list):  # Parameters go HERE
+            with self.bb.dataflow():
+                self._debug_log("Starting dataflow block")
+                
+                self._convert_operators(model)
+                self._debug_log(f"Converted operators")
+
+                # Get outputs
+                subgraph = model.Subgraphs(0)
+                model_outputs = subgraph.OutputsAsNumpy()
+                self._debug_log(f"Model has {len(model_outputs)} outputs")
+                
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+
+                output_var = self.bb.emit_output(outputs)
+                self._debug_log("Emitted output variable")
+
+            # CRITICAL: emit_func_output WITHOUT params parameter
+            self.bb.emit_func_output(output_var)  # NO params here!
+            self._debug_log("Emitted function output")
+
+        # Get the module (after function scope ends)
+        self._debug_log("Building module")
+        relax_mod = self.bb.get()
+        
+        # Apply attributes to the main function
+        try:
+            main_func = relax_mod["main"]
+            relax_mod["main"] = main_func.with_attrs(func_attrs)
+            self._debug_log("Attached function attributes")
+        except Exception as attr_e:
+            self._debug_log(f"Error attaching attributes: {attr_e}")
+            raise       
+        
+        # Return numpy arrays for backward compatibility
+        np_params = {}
+        for name, (var, numpy_array) in self._params.items():
+            if hasattr(numpy_array, 'flags') and not numpy_array.flags.writeable:
+                np_params[name] = np.array(numpy_array, copy=True)
+            else:
+                np_params[name] = numpy_array
+
+        self._debug_log("Conversion complete")
+        print(f"Final parameters dict has {len(np_params)} entries")
+        return relax_mod, np_params
+
+    def working_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model."""
         self._debug_log("Starting TFLite to Relax conversion")
         
@@ -597,6 +709,9 @@ class TFLiteGraphImporter:
                     # Create input list from actual input variables only
                     input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
                     self._debug_log(f"Input list length: {len(input_list)}")
+
+                    self._debug_log(f"Preparing to attach parameters: {self._params}")
+                    print(f"Preparing to attach parameters: {self._params}" )
                     
                     # Attach params if they are available and keep_params_in_input is True
                     if self._keep_params_in_input and self._params:
@@ -661,6 +776,7 @@ class TFLiteGraphImporter:
             self._debug_log(f"Error attaching attributes: {attr_e}")
             raise       
         
+        print(self._params)
         # Return numpy arrays for backward compatibility
         np_params = {}
         for name, (var, tvm_array) in self._params.items():
@@ -970,8 +1086,45 @@ class TFLiteGraphImporter:
             "TRANSPOSE": self.convert_transpose,
         }
 
-
     def _parse_model_inputs(self, model):
+        """Parse model inputs and create Relax variables - FIXED for consistent naming."""
+        subgraph = model.Subgraphs(0)
+        model_inputs = subgraph.InputsAsNumpy()
+
+        for model_input in model_inputs:
+            input_name = get_tensor_name(subgraph, model_input)  # Already sanitized
+            tensor = subgraph.Tensors(model_input)
+
+            # Get shape and dtype
+            if input_name in self._shape:
+                shape = self._shape[input_name]
+            else:
+                if tensor.ShapeLength() > 0:
+                    # Simple conversion: numpy int32 -> Python int
+                    raw_shape = tensor.ShapeAsNumpy()
+                    shape = tuple(int(dim) for dim in raw_shape)
+                else:
+                    shape = ()
+
+            if isinstance(self._dtype, dict) and input_name in self._dtype:
+                dtype = self._dtype[input_name]
+            elif isinstance(self._dtype, str):
+                dtype = self._dtype
+            else:
+                dtype = self._get_tensor_type_str(tensor.Type())
+
+            # Create Relax variable with sanitized name
+            input_var = relax.Var(
+                name_hint=input_name,  # Already sanitized
+                struct_info=relax.TensorStructInfo(shape=shape, dtype=dtype),
+            )
+
+            self._nodes[input_name] = input_var
+            self._debug_log(f"Created input var: {input_name}, shape: {shape}, dtype: {dtype}")
+            self._inputs[input_name] = input_var
+            self._num_input += 1
+
+    def old_parse_model_inputs(self, model):
         """Parse model inputs and create Relax variables."""
         subgraph = model.Subgraphs(0)
         model_inputs = subgraph.InputsAsNumpy()
@@ -1146,8 +1299,9 @@ class TFLiteGraphImporter:
         """Check if a tensor has a constant value."""
         return tensor_wrapper.buffer is not None and tensor_wrapper.buffer.DataLength() > 0
 
+
     def _get_tensor_value(self, tensor_wrapper):
-        """Get tensor buffer value from tensor wrapper."""
+        """Get tensor buffer value from tensor wrapper - Fixed for readonly arrays."""
         if not self._has_tensor_value(tensor_wrapper):
             return None
 
@@ -1159,7 +1313,13 @@ class TFLiteGraphImporter:
         else:
             shape = []
 
-        return np.frombuffer(data, dtype=dtype).reshape(shape)
+        # Create array from buffer and make a writable copy to avoid DLPack readonly issues
+        array = np.frombuffer(data, dtype=dtype).reshape(shape)
+        
+        # CRITICAL FIX: Make a writable copy to avoid DLPack readonly error
+        writable_array = np.array(array, copy=True)
+        
+        return writable_array
 
     def _get_numpy_dtype(self, tensor_type):
         """Get numpy dtype from TFLite tensor type."""
@@ -1182,6 +1342,81 @@ class TFLiteGraphImporter:
             raise NotImplementedError(f"Tensor type {tensor_type} is not supported")
         
     def _get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor - FIXED for consistent naming."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
+
+        if tensor_name in self._nodes:
+            self._debug_log(f"Found existing node for: {tensor_name}")
+            return self._nodes[tensor_name]
+        else:
+            # Check if this tensor has constant data (weights/biases)
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            # Get the tensor value as numpy array
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            self._debug_log(f"Creating parameter: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
+
+            # Follow ONNX pattern for parameter handling
+            if self._keep_params_in_input:
+                # CRITICAL: Use the sanitized name consistently
+                param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
+                self._nodes[tensor_name] = param_var
+                # Store as (var, numpy_array) tuple like ONNX does
+                self._params[tensor_name] = (param_var, value)  # value is already numpy array
+                self._debug_log(f"Added parameter {tensor_name} to params dict")
+                return param_var
+            else:
+                # Use constant directly
+                const_expr = relax.const(value)
+                self._nodes[tensor_name] = const_expr
+                return const_expr
+
+        
+    def old_get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor - Fixed to follow ONNX pattern."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
+
+        if tensor_name in self._nodes:
+            self._debug_log(f"Found existing node for: {tensor_name}")
+            return self._nodes[tensor_name]
+        else:
+            # Check if this tensor has constant data (weights/biases)
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            # Get the tensor value as numpy array
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            self._debug_log(f"Creating parameter: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
+
+            # Follow ONNX pattern for parameter handling
+            if self._keep_params_in_input:
+                # Create variable for the parameter
+                param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
+                self._nodes[tensor_name] = param_var
+                # Store as (var, numpy_array) tuple like ONNX does
+                self._params[tensor_name] = (param_var, value)  # value is already numpy array
+                self._debug_log(f"Added parameter {tensor_name} to params dict")
+                return param_var
+            else:
+                # Use constant directly
+                const_expr = relax.const(value)
+                self._nodes[tensor_name] = const_expr
+                return const_expr
+
+    def _new_var(self, var_name: str, shape: List, dtype: str = "float32"):
+        """Creates a new Relax variable - same as ONNX version."""
+        return relax.Var(
+            name_hint=var_name, struct_info=relax.TensorStructInfo(shape=shape, dtype=dtype)
+        )        
+    
+    def bad_get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
         
