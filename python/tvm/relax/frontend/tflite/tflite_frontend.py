@@ -198,90 +198,6 @@ class TFLiteGraphImporter:
             "TRANSPOSE": self.convert_transpose,
         }
 
-    def _get_tensor_expr(self, tensor_wrapper):
-        """Get Relax expression for a tensor."""
-        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
-        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
-
-        if tensor_name in self._nodes:
-            self._debug_log(f"Found existing node for: {tensor_name}")
-            return self._nodes[tensor_name]
-        else:
-            # Create constant and treat it as a parameter
-            if not self._has_tensor_value(tensor_wrapper):
-                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
-
-            value = self._get_tensor_value(tensor_wrapper)
-            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
-            
-            self._debug_log(f"Creating parameter: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
-
-            param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
-            self._nodes[tensor_name] = param_var
-            # Store as (var, value) tuple like ONNX does - NO _param_vars reference
-            self._params[tensor_name] = (param_var, tvm.nd.array(value))
-            return param_var
-
-    def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-        """Construct Relax expressions from the TFLite model."""
-        self._debug_log("Starting TFLite to Relax conversion")
-        
-        # Store model reference for use in other methods
-        self.current_model = model
-
-        with self.bb.function("main"):
-            self._debug_log("Created main function")
-            with self.bb.dataflow():
-                self._debug_log("Starting dataflow block")
-                
-                self._parse_model_inputs(model)
-                self._debug_log(f"Parsed {len(self._inputs)} model inputs")
-                
-                self._convert_operators(model)
-                self._debug_log(f"Converted operators, created {len(self._params)} parameters")
-
-                # Get outputs
-                subgraph = model.Subgraphs(0)
-                model_outputs = subgraph.OutputsAsNumpy()
-                self._debug_log(f"Model has {len(model_outputs)} outputs")
-                
-                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
-
-                output_var = self.bb.emit_output(outputs)
-                self._debug_log("Emitted output variable")
-
-            # Create function attributes following ONNX pattern
-            func_attrs = {"num_input": self._num_input}
-            
-            # Create input list from actual input variables only
-            input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
-            self._debug_log(f"Input list length: {len(input_list)}")
-            
-            # Attach params if they are available and keep_params_in_input is True
-            if self._keep_params_in_input and self._params:
-                param_var_list, param_value_list = map(list, zip(*self._params.values()))
-                input_list = input_list + param_var_list
-                func_attrs["params"] = param_value_list
-                self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
-
-            self.bb.emit_func_output(output_var, params=input_list)
-            self._debug_log("Emitted function output")
-
-        self._debug_log("Building module")
-        relax_mod = self.bb.get()
-        
-        # Attach attributes like ONNX does
-        relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
-        self._debug_log("Attached function attributes")
-        
-        # Return numpy arrays for backward compatibility
-        np_params = {}
-        for name, (var, tvm_array) in self._params.items():
-            np_params[name] = tvm_array.numpy()
-
-        self._debug_log("Conversion complete")
-        return relax_mod, np_params
     
     def convert_resize_bilinear(self, subgraph, op):
         """Convert TFLite RESIZE_BILINEAR operator."""
@@ -645,11 +561,123 @@ class TFLiteGraphImporter:
             self._debug_log(f"  Traceback: {traceback.format_exc()}")
             raise
 
-
-
     def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model."""
         self._debug_log("Starting TFLite to Relax conversion")
+        
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        try:
+            with self.bb.function("main"):
+                try:
+                    with self.bb.dataflow():
+                        self._debug_log("Starting dataflow block")
+                        
+                        self._parse_model_inputs(model)
+                        self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+                        
+                        self._convert_operators(model)
+                        self._debug_log(f"Converted operators, created {len(self._params)} parameters")
+
+                        # Get outputs
+                        subgraph = model.Subgraphs(0)
+                        model_outputs = subgraph.OutputsAsNumpy()
+                        self._debug_log(f"Model has {len(model_outputs)} outputs")
+                        
+                        outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                        outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+
+                        output_var = self.bb.emit_output(outputs)
+                        self._debug_log("Emitted output variable")
+
+                    # Create function attributes and input list
+                    func_attrs = {"num_input": self._num_input}
+                    
+                    # Create input list from actual input variables only
+                    input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+                    self._debug_log(f"Input list length: {len(input_list)}")
+                    
+                    # Attach params if they are available and keep_params_in_input is True
+                    if self._keep_params_in_input and self._params:
+                        # Extract variables and arrays from self._params (which stores (var, tvm_array) tuples)
+                        param_var_list, param_value_list = map(list, zip(*self._params.values()))
+                        
+                        # Convert TVM arrays to numpy arrays for function attributes
+                        param_value_list = [
+                            tvm_array.numpy() if hasattr(tvm_array, 'numpy') else tvm_array 
+                            for tvm_array in param_value_list
+                        ]
+                        
+                        # Add parameter variables to input list
+                        input_list = input_list + param_var_list
+                        
+                        # Store numpy arrays in function attributes
+                        func_attrs["params"] = param_value_list
+                        self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
+
+                    # CRITICAL: Must call emit_func_output before exiting function scope
+                    self.bb.emit_func_output(output_var, params=input_list)
+                    self._debug_log("Emitted function output")
+                    
+                except Exception as e:
+                    self._debug_log(f"Error during function construction: {e}")
+                    raise
+                    
+        except Exception as e:
+            self._debug_log(f"Error during function scope: {e}")
+            raise
+
+        # Get the module
+        self._debug_log("Building module")
+        relax_mod = self.bb.get()
+        
+        # Verify module was built correctly
+        try:
+            module_functions = list(relax_mod.functions.keys())
+            self._debug_log(f"Module functions: {module_functions}")
+            
+            if not module_functions:
+                raise RuntimeError("Module is empty - no functions were added")
+            
+            # Use proper GlobalVar name extraction
+            function_names = [f.name_hint for f in module_functions]
+            self._debug_log(f"Function names: {function_names}")
+            
+            if "main" not in function_names:
+                self._debug_log(f"Available function names: {function_names}")
+                raise RuntimeError(f"'main' function not found in module. Available: {function_names}")
+                
+        except Exception as debug_e:
+            self._debug_log(f"Error checking module functions: {debug_e}")
+            raise RuntimeError("Failed to build module properly") from debug_e
+
+        # Apply attributes to the main function
+        try:
+            main_func = relax_mod["main"]
+            relax_mod["main"] = main_func.with_attrs(func_attrs)
+            self._debug_log("Attached function attributes")
+        except Exception as attr_e:
+            self._debug_log(f"Error attaching attributes: {attr_e}")
+            raise       
+        
+        # Return numpy arrays for backward compatibility
+        np_params = {}
+        for name, (var, tvm_array) in self._params.items():
+            if hasattr(tvm_array, 'numpy'):
+                np_params[name] = tvm_array.numpy()
+            else:
+                np_params[name] = tvm_array
+
+        self._debug_log("Conversion complete")
+        return relax_mod, np_params
+
+    def old_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model."""
+        self._debug_log("Starting TFLite to Relax conversion")
+
+        print("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+
         
         # Store model reference for use in other methods
         self.current_model = model
@@ -682,37 +710,46 @@ class TFLiteGraphImporter:
             # Create input list from actual input variables only
             input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
             self._debug_log(f"Input list length: {len(input_list)}")
-            
+
             # Attach params if they are available and keep_params_in_input is True
             if self._keep_params_in_input and self._params:
+                # Extract variables and arrays from self._params (which stores (var, tvm_array) tuples)
                 param_var_list, param_value_list = map(list, zip(*self._params.values()))
+                
+                # Convert TVM arrays to numpy arrays for function attributes
+                param_value_list = [
+                    tvm_array.numpy() if hasattr(tvm_array, 'numpy') else tvm_array 
+                    for tvm_array in param_value_list
+                ]
+                
+                # Add parameter variables to input list
                 input_list = input_list + param_var_list
+                
+                # Store numpy arrays in function attributes
                 func_attrs["params"] = param_value_list
                 self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
 
-            self.bb.emit_func_output(output_var, params=input_list)
-            self._debug_log("Emitted function output")
 
-        self._debug_log("Building module")
-        relax_mod = self.bb.get()
-        
-        # Attach attributes like ONNX does
-        relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
-        self._debug_log("Attached function attributes")
-        
-        # Return numpy arrays for backward compatibility
-        np_params = {}
-        for name, (var, tvm_array) in self._params.items():
-            # Handle both TVM NDArray and numpy array cases
-            if hasattr(tvm_array, 'numpy'):
-                # It's a TVM NDArray, convert to numpy
-                np_params[name] = tvm_array.numpy()
-            else:
-                # It's already a numpy array
-                np_params[name] = tvm_array        
-        
-        self._debug_log("Conversion complete")
-        return relax_mod, np_params
+            self._debug_log("Building module")
+            relax_mod = self.bb.get()
+            print("@@@@@@@@@@@@@@@")
+
+            # Return numpy arrays for backward compatibility (separate from function attributes)
+            np_params = {}
+            for name, (var, tvm_array) in self._params.items():
+                if hasattr(tvm_array, 'numpy'):
+                    np_params[name] = tvm_array.numpy()
+                else:
+                    np_params[name] = tvm_array
+
+            #print(relax_mod)            
+            # Attach attributes like ONNX does
+            relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
+            self._debug_log("Attached function attributes")
+            
+            
+            self._debug_log("Conversion complete")
+            return relax_mod, np_params
 
 
     # Add these methods to your TFLiteGraphImporter class
@@ -947,7 +984,12 @@ class TFLiteGraphImporter:
             if input_name in self._shape:
                 shape = self._shape[input_name]
             else:
-                shape = tuple(tensor.ShapeAsNumpy()) if tensor.ShapeLength() > 0 else ()
+                if tensor.ShapeLength() > 0:
+                    # Simple conversion: numpy int32 -> Python int
+                    raw_shape = tensor.ShapeAsNumpy()
+                    shape = tuple(int(dim) for dim in raw_shape)
+                else:
+                    shape = ()
 
             if isinstance(self._dtype, dict) and input_name in self._dtype:
                 dtype = self._dtype[input_name]
@@ -956,6 +998,8 @@ class TFLiteGraphImporter:
             else:
                 dtype = self._get_tensor_type_str(tensor.Type())
 
+            # Dont turn shape into list, keep it as tuple
+            # shape=list(shape)
             # Create Relax variable
             input_var = relax.Var(
                 name_hint=input_name,
@@ -963,9 +1007,10 @@ class TFLiteGraphImporter:
             )
 
             self._nodes[input_name] = input_var
+            print("VAR", input_name, shape, dtype)
             self._inputs[input_name] = input_var
             self._num_input += 1
-
+            
     def _convert_operators(self, model):
         """Convert TFLite operators to Relax expressions."""
         subgraph = model.Subgraphs(0)
@@ -1135,8 +1180,26 @@ class TFLiteGraphImporter:
             return type_map[tensor_type]
         except KeyError:
             raise NotImplementedError(f"Tensor type {tensor_type} is not supported")
-
+        
     def _get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        
+        if tensor_name in self._nodes:
+            return self._nodes[tensor_name]
+        else:
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            # Create constant directly instead of parameter
+            const_expr = relax.const(value, dtype)
+            self._nodes[tensor_name] = const_expr
+            return const_expr
+
+    def complex_get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
 
@@ -2165,3 +2228,31 @@ def from_tflite(
     """
     importer = TFLiteGraphImporter(shape_dict, dtype_dict, keep_params_in_input)
     return importer.from_tflite(model)
+
+
+def simple_from_tflite(self, model):
+    """Simplified TFLite conversion."""
+    self.current_model = model
+
+    with self.bb.function("main"):
+        with self.bb.dataflow():
+            self._parse_model_inputs(model)
+            self._convert_operators(model)
+
+            # Get outputs
+            subgraph = model.Subgraphs(0)
+            model_outputs = subgraph.OutputsAsNumpy()
+            outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+            outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+            
+            output_var = self.bb.emit_output(outputs)
+
+        # Simple function signature with just inputs
+        input_list = list(self._inputs.values())
+        self.bb.emit_func_output(output_var, params=input_list)
+
+    # Get module
+    relax_mod = self.bb.get()
+    
+    # Return empty params dict since we're using constants
+    return relax_mod, {}
