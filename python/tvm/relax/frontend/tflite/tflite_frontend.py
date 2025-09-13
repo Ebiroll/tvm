@@ -1888,8 +1888,70 @@ class TFLiteGraphImporter:
         output_dtype = self._get_tensor_type_str(output_tensors[0].tensor.Type())
 
         return self.bb.normalize(relax.op.astype(input_expr, output_dtype))
-
+    
     def convert_reduce_mean(self, subgraph, op):
+        from tflite.BuiltinOptions import BuiltinOptions
+        from tflite.ReducerOptions import ReducerOptions
+
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) == 2
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        data_sinfo = data_expr.struct_info
+        rank = len(getattr(data_sinfo, "shape", [])) if hasattr(data_sinfo, "shape") else None
+
+        # Parse axes tensor (2nd input)
+        axes_tensor = input_tensors[1]
+        axes = None
+        if self._has_tensor_value(axes_tensor):
+            axes_value = self._get_tensor_value(axes_tensor)
+            if axes_value is not None:
+                # CRITICAL FIX: Handle both scalar and array axes
+                axes_raw = axes_value.tolist()
+                
+                # Convert scalar to list for consistent handling
+                if isinstance(axes_raw, int):
+                    axes_list = [axes_raw]
+                elif isinstance(axes_raw, list):
+                    axes_list = axes_raw
+                else:
+                    axes_list = []
+                
+                self._debug_log(f"Mean axes: raw={axes_raw}, processed={axes_list}")
+                
+                if len(axes_list) == 0:
+                    axes = []  # explicit empty => no-op reduction
+                else:
+                    # normalize negatives and dedup
+                    if rank is not None:
+                        norm = []
+                        for a in axes_list:
+                            a = int(a)
+                            if a < 0:
+                                a += rank
+                            norm.append(a)
+                        axes = sorted(set(norm))
+                    else:
+                        # fallback: pass as-is
+                        axes = tuple(int(a) for a in axes_list)
+
+        # KeepDims from ReducerOptions
+        keepdims = False
+        if op.BuiltinOptionsType() == BuiltinOptions.ReducerOptions:
+            opts = op.BuiltinOptions()
+            ro = ReducerOptions()
+            ro.Init(opts.Bytes, opts.Pos)
+            keepdims = bool(ro.KeepDims())
+
+        # Handle the reduction
+        if axes == []:
+            return data_expr  # identity, regardless of keepdims
+
+        self._debug_log(f"Mean operation: axes={axes}, keepdims={keepdims}")
+        return self.bb.normalize(relax.op.mean(data_expr, axis=axes, keepdims=keepdims))
+
+    def old_convert_reduce_mean(self, subgraph, op):
         from tflite.BuiltinOptions import BuiltinOptions
         from tflite.ReducerOptions import ReducerOptions
 
