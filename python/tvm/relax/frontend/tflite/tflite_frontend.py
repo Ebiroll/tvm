@@ -738,265 +738,6 @@ class TFLiteGraphImporter:
         debug_ir_variables(relax_mod)
         return relax_mod, np_params
 
-    def working_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-        """Construct Relax expressions from the TFLite model."""
-        self._debug_log("Starting TFLite to Relax conversion")
-        
-        # Store model reference for use in other methods
-        self.current_model = model
-
-        try:
-            with self.bb.function("main"):
-                try:
-                    with self.bb.dataflow():
-                        self._debug_log("Starting dataflow block")
-                        
-                        self._parse_model_inputs(model)
-                        self._debug_log(f"Parsed {len(self._inputs)} model inputs")
-                        
-                        self._convert_operators(model)
-                        self._debug_log(f"Converted operators, created {len(self._params)} parameters")
-
-                        # Get outputs
-                        subgraph = model.Subgraphs(0)
-                        model_outputs = subgraph.OutputsAsNumpy()
-                        self._debug_log(f"Model has {len(model_outputs)} outputs")
-                        
-                        outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                        outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
-
-                        output_var = self.bb.emit_output(outputs)
-                        self._debug_log("Emitted output variable")
-
-                    # Create function attributes and input list
-                    func_attrs = {"num_input": self._num_input}
-                    
-                    # Create input list from actual input variables only
-                    input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
-                    self._debug_log(f"Input list length: {len(input_list)}")
-
-                    self._debug_log(f"Preparing to attach parameters: {self._params}")
-                    print(f"Preparing to attach parameters: {self._params}" )
-                    
-                    # Attach params if they are available and keep_params_in_input is True
-                    if self._keep_params_in_input and self._params:
-                        # Extract variables and arrays from self._params (which stores (var, tvm_array) tuples)
-                        param_var_list, param_value_list = map(list, zip(*self._params.values()))
-                        
-                        # Convert TVM arrays to numpy arrays for function attributes
-                        param_value_list = [
-                            tvm_array.numpy() if hasattr(tvm_array, 'numpy') else tvm_array 
-                            for tvm_array in param_value_list
-                        ]
-                        
-                        # Add parameter variables to input list
-                        input_list = input_list + param_var_list
-                        
-                        # Store numpy arrays in function attributes
-                        func_attrs["params"] = param_value_list
-                        self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
-
-                    # CRITICAL: Must call emit_func_output before exiting function scope
-                    self.bb.emit_func_output(output_var, params=input_list)
-                    self._debug_log("Emitted function output")
-                    
-                except Exception as e:
-                    self._debug_log(f"Error during function construction: {e}")
-                    raise
-                    
-        except Exception as e:
-            self._debug_log(f"Error during function scope: {e}")
-            raise
-
-        # Get the module
-        self._debug_log("Building module")
-        relax_mod = self.bb.get()
-        
-        # Verify module was built correctly
-        try:
-            module_functions = list(relax_mod.functions.keys())
-            self._debug_log(f"Module functions: {module_functions}")
-            
-            if not module_functions:
-                raise RuntimeError("Module is empty - no functions were added")
-            
-            # Use proper GlobalVar name extraction
-            function_names = [f.name_hint for f in module_functions]
-            self._debug_log(f"Function names: {function_names}")
-            
-            if "main" not in function_names:
-                self._debug_log(f"Available function names: {function_names}")
-                raise RuntimeError(f"'main' function not found in module. Available: {function_names}")
-                
-        except Exception as debug_e:
-            self._debug_log(f"Error checking module functions: {debug_e}")
-            raise RuntimeError("Failed to build module properly") from debug_e
-
-        # Apply attributes to the main function
-        try:
-            main_func = relax_mod["main"]
-            relax_mod["main"] = main_func.with_attrs(func_attrs)
-            self._debug_log("Attached function attributes")
-        except Exception as attr_e:
-            self._debug_log(f"Error attaching attributes: {attr_e}")
-            raise       
-        
-        print(self._params)
-        # Return numpy arrays for backward compatibility
-        np_params = {}
-        for name, (var, tvm_array) in self._params.items():
-            if hasattr(tvm_array, 'numpy'):
-                np_params[name] = tvm_array.numpy()
-            else:
-                np_params[name] = tvm_array
-
-        self._debug_log("Conversion complete")
-        return relax_mod, np_params
-
-    def old_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-        """Construct Relax expressions from the TFLite model."""
-        self._debug_log("Starting TFLite to Relax conversion")
-
-        print("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
-
-        
-        # Store model reference for use in other methods
-        self.current_model = model
-
-        with self.bb.function("main"):
-            self._debug_log("Created main function")
-            with self.bb.dataflow():
-                self._debug_log("Starting dataflow block")
-                
-                self._parse_model_inputs(model)
-                self._debug_log(f"Parsed {len(self._inputs)} model inputs")
-                
-                self._convert_operators(model)
-                self._debug_log(f"Converted operators, created {len(self._params)} parameters")
-
-                # Get outputs
-                subgraph = model.Subgraphs(0)
-                model_outputs = subgraph.OutputsAsNumpy()
-                self._debug_log(f"Model has {len(model_outputs)} outputs")
-                
-                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
-
-                output_var = self.bb.emit_output(outputs)
-                self._debug_log("Emitted output variable")
-
-            # Create function attributes following ONNX pattern
-            func_attrs = {"num_input": self._num_input}
-            
-            # Create input list from actual input variables only
-            input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
-            self._debug_log(f"Input list length: {len(input_list)}")
-
-            # Attach params if they are available and keep_params_in_input is True
-            if self._keep_params_in_input and self._params:
-                # Extract variables and arrays from self._params (which stores (var, tvm_array) tuples)
-                param_var_list, param_value_list = map(list, zip(*self._params.values()))
-                
-                # Convert TVM arrays to numpy arrays for function attributes
-                param_value_list = [
-                    tvm_array.numpy() if hasattr(tvm_array, 'numpy') else tvm_array 
-                    for tvm_array in param_value_list
-                ]
-                
-                # Add parameter variables to input list
-                input_list = input_list + param_var_list
-                
-                # Store numpy arrays in function attributes
-                func_attrs["params"] = param_value_list
-                self._debug_log(f"Added {len(param_var_list)} parameters to function signature")
-
-
-            self._debug_log("Building module")
-            relax_mod = self.bb.get()
-            print("@@@@@@@@@@@@@@@")
-
-            # Return numpy arrays for backward compatibility (separate from function attributes)
-            np_params = {}
-            for name, (var, tvm_array) in self._params.items():
-                if hasattr(tvm_array, 'numpy'):
-                    np_params[name] = tvm_array.numpy()
-                else:
-                    np_params[name] = tvm_array
-
-            #print(relax_mod)            
-            # Attach attributes like ONNX does
-            relax_mod["main"] = relax_mod["main"].with_attrs(func_attrs)
-            self._debug_log("Attached function attributes")
-            
-            
-            self._debug_log("Conversion complete")
-            return relax_mod, np_params
-
-
-    # Add these methods to your TFLiteGraphImporter class
-
-    def _validate_pool_params(self, data_shape, kernel_size, strides, padding):
-        """Validate pool parameters before creating the operation."""
-        self._debug_log("Validating pool parameters...")
-        
-        if len(data_shape) != 4:
-            raise ValueError(f"Expected 4D input, got {len(data_shape)}D: {data_shape}")
-        
-        batch, height, width, channels = data_shape
-        kernel_h, kernel_w = kernel_size
-        stride_h, stride_w = strides
-        pad_top, pad_left, pad_bottom, pad_right = padding
-        
-        # Convert symbolic dimensions to concrete values for validation
-        try:
-            h_val = int(height) if hasattr(height, 'value') else int(height)
-            w_val = int(width) if hasattr(width, 'value') else int(width)
-        except (TypeError, AttributeError):
-            self._debug_log("Symbolic dimensions detected, skipping strict validation")
-            return
-        
-        # Check for invalid parameters
-        if kernel_h <= 0 or kernel_w <= 0:
-            raise ValueError(f"Invalid kernel size: [{kernel_h}, {kernel_w}]")
-        
-        if stride_h <= 0 or stride_w <= 0:
-            raise ValueError(f"Invalid stride: [{stride_h}, {stride_w}]")
-        
-        if any(p < 0 for p in padding):
-            raise ValueError(f"Negative padding not allowed: {padding}")
-        
-        # Check if kernel is larger than input + padding
-        effective_h = h_val + pad_top + pad_bottom
-        effective_w = w_val + pad_left + pad_right
-        
-        if kernel_h > effective_h:
-            raise ValueError(f"Kernel height {kernel_h} > effective input height {effective_h}")
-        
-        if kernel_w > effective_w:
-            raise ValueError(f"Kernel width {kernel_w} > effective input width {effective_w}")
-        
-        # Calculate expected output shape
-        out_h = (effective_h - kernel_h) // stride_h + 1
-        out_w = (effective_w - kernel_w) // stride_w + 1
-        
-        self._debug_log(f"Validation passed - expected output: [{batch}, {out_h}, {out_w}, {channels}]")
-
-    def _safe_int_extract(self, value, name="value"):
-        """Safely extract integer from TVM expressions."""
-        try:
-            if isinstance(value, int):
-                return value
-            elif hasattr(value, 'value'):
-                return int(value.value)
-            elif isinstance(value, tvm.tir.IntImm):
-                return int(value)
-            else:
-                self._debug_log(f"Could not extract {name}: {type(value)}, returning default")
-                return 224  # Safe default
-        except Exception as e:
-            self._debug_log(f"Error extracting {name}: {e}, returning default")
-            return 224
-
     def _convert_pool2d_safe(self, subgraph, op, pool_type):
         """Safe pool2d conversion with extensive validation."""
         try:
@@ -1195,7 +936,7 @@ class TFLiteGraphImporter:
 
         print(f"DEBUG: Total inputs created: {len(self._inputs)}")
         print(f"DEBUG: Input names: {list(self._inputs.keys())}")
-        
+
     def old_parse_model_inputs(self, model):
         """Parse model inputs and create Relax variables."""
         subgraph = model.Subgraphs(0)
@@ -1390,8 +1131,15 @@ class TFLiteGraphImporter:
         
         # CRITICAL FIX: Make a writable copy to avoid DLPack readonly error
         writable_array = np.array(array, copy=True)
+
+        array = np.frombuffer(data, dtype=dtype).reshape(shape)
+    
+        # DEBUG: Check if buffer data is actually zeros
+        print(f"First 10 values: {array.flatten()[:10]}")
         
+        writable_array = np.array(array, copy=True)
         return writable_array
+        
 
     def _get_numpy_dtype(self, tensor_type):
         """Get numpy dtype from TFLite tensor type."""
@@ -1996,7 +1744,7 @@ class TFLiteGraphImporter:
         return result
 
     def convert_transpose(self, subgraph, op):
-        """Convert TFLite TRANSPOSE operator."""
+        """Convert TFLite TRANSPOSE operator - Reshape-based contiguity fix."""
         self.current_subgraph = subgraph
         input_tensors = self._get_input_tensors(subgraph, op)
         assert len(input_tensors) == 2
@@ -2006,8 +1754,17 @@ class TFLiteGraphImporter:
         if perm is not None:
             perm = tuple(perm.tolist())
 
-        return self.bb.normalize(relax.op.permute_dims(data_expr, perm))
-
+        # Perform transpose
+        result = self.bb.normalize(relax.op.permute_dims(data_expr, perm))
+        
+        # STRONGER FIX: Force contiguity with reshape (same shape)
+        result_shape = result.struct_info.shape
+        result = self.bb.normalize(relax.op.reshape(result, result_shape))
+        
+        self._debug_log(f"Transpose + reshape: {data_expr.struct_info.shape} -> {result.struct_info.shape}")
+        
+        return result
+    
     def convert_squeeze(self, subgraph, op):
         """Convert TFLite SQUEEZE operator."""
         try:
