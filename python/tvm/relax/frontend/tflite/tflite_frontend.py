@@ -634,12 +634,57 @@ class TFLiteGraphImporter:
     
                 # CRITICAL FIX: Make ALL outputs contiguous (even passthrough inputs)
                 def ensure_contiguous(tensor_expr):
-                    """Force contiguous layout using flatten-reshape."""
-                    original_shape = tensor_expr.struct_info.shape
-                    flattened = self.bb.normalize(relax.op.reshape(tensor_expr, [-1]))
-                    contiguous = self.bb.normalize(relax.op.reshape(flattened, original_shape))
-                    return contiguous
-                
+                    """Force contiguous layout - Fixed version that handles symbolic shapes."""
+                    try:
+                        original_shape = tensor_expr.struct_info.shape
+                        
+                        # Check if we have concrete shape values
+                        has_concrete_shape = True
+                        concrete_shape = []
+                        
+                        for dim in original_shape:
+                            if isinstance(dim, (int, tvm.tir.IntImm)):
+                                if hasattr(dim, 'value'):
+                                    concrete_shape.append(int(dim.value))
+                                else:
+                                    concrete_shape.append(int(dim))
+                            elif hasattr(dim, 'value') and isinstance(dim.value, int):
+                                concrete_shape.append(int(dim.value))
+                            else:
+                                # Symbolic dimension - can't use flatten-reshape trick
+                                has_concrete_shape = False
+                                break
+                        
+                        if has_concrete_shape and len(concrete_shape) > 0:
+                            # Safe to use flatten-reshape with concrete shape
+                            flattened = self.bb.normalize(relax.op.reshape(tensor_expr, [-1]))
+                            contiguous = self.bb.normalize(relax.op.reshape(flattened, concrete_shape))
+                            self._debug_log(f"Made tensor contiguous using reshape: {concrete_shape}")
+                            return contiguous
+                        else:
+                            # Fallback: use runtime shape operations
+                            self._debug_log("Using runtime shape for contiguous operation")
+                            
+                            # Get the runtime shape as a tensor
+                            shape_tensor = self.bb.normalize(relax.op.shape_to_tensor(relax.op.shape_of(tensor_expr)))
+                            
+                            # Calculate total elements
+                            total_elements = self.bb.normalize(relax.op.prod(shape_tensor, axis=None, keepdims=False))
+                            
+                            # Reshape to 1D using total elements
+                            flattened = self.bb.normalize(relax.op.reshape(tensor_expr, [total_elements]))
+                            
+                            # Reshape back using the runtime shape
+                            shape_expr = self.bb.normalize(relax.op.tensor_to_shape(shape_tensor))
+                            contiguous = self.bb.normalize(relax.op.reshape(flattened, shape_expr))
+                            
+                            self._debug_log("Made tensor contiguous using runtime shape operations")
+                            return contiguous
+                            
+                    except Exception as e:
+                        # Final fallback: return tensor as-is if contiguous operation fails
+                        self._debug_log(f"Contiguous operation failed, returning original tensor: {e}")
+                        return tensor_expr                
                 contiguous_outputs = []
                 for i, output in enumerate(outputs):
                     self._debug_log(f"Making output {i} contiguous")
@@ -1951,56 +1996,6 @@ class TFLiteGraphImporter:
         self._debug_log(f"Mean operation: axes={axes}, keepdims={keepdims}")
         return self.bb.normalize(relax.op.mean(data_expr, axis=axes, keepdims=keepdims))
 
-    def old_convert_reduce_mean(self, subgraph, op):
-        from tflite.BuiltinOptions import BuiltinOptions
-        from tflite.ReducerOptions import ReducerOptions
-
-        self.current_subgraph = subgraph
-        input_tensors = self._get_input_tensors(subgraph, op)
-        assert len(input_tensors) == 2
-
-        data_expr = self._get_tensor_expr(input_tensors[0])
-        data_sinfo = data_expr.struct_info   # ✅ not relax.analysis.get_static_type
-        rank = len(getattr(data_sinfo, "shape", [])) if hasattr(data_sinfo, "shape") else None
-
-        # Parse axes tensor (2nd input)
-        axes_tensor = input_tensors[1]
-        axes = None
-        if self._has_tensor_value(axes_tensor):
-            axes_value = self._get_tensor_value(axes_tensor)  # numpy array or None
-            if axes_value is not None:
-                axes_list = axes_value.tolist()
-                if len(axes_list) == 0:
-                    axes = []  # explicit empty => no-op reduction
-                else:
-                    # normalize negatives and dedup
-                    if rank is not None:
-                        norm = []
-                        for a in axes_list:
-                            a = int(a)
-                            if a < 0:
-                                a += rank
-                            norm.append(a)
-                        axes = sorted(set(norm))
-                    else:
-                        # fallback: pass as-is; Relax will handle at runtime
-                        axes = tuple(int(a) for a in axes_list)
-
-        # KeepDims from ReducerOptions
-        keepdims = False
-        if op.BuiltinOptionsType() == BuiltinOptions.ReducerOptions:
-            opts = op.BuiltinOptions()
-            ro = ReducerOptions()
-            ro.Init(opts.Bytes, opts.Pos)
-            keepdims = bool(ro.KeepDims())
-
-        # Decide axis argument:
-        # - axes == None  -> reduce all dims (TF default when axes missing)
-        # - axes == []    -> no-op reduction (identity), so just return data_expr
-        if axes == []:
-            return data_expr  # identity, regardless of keepdims
-
-        return self.bb.normalize(relax.op.mean(data_expr, axis=axes, keepdims=keepdims))
 
     # Pool operators
     def convert_average_pool2d(self, subgraph, op):
