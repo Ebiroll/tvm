@@ -594,6 +594,64 @@ class TFLiteGraphImporter:
             raise
 
     def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model - Fixed to ensure parameters exist."""
+        self._debug_log("Starting TFLite to Relax conversion")
+        
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        # CRITICAL: Parse inputs BEFORE creating function to ensure we have input parameters
+        self._parse_model_inputs(model)
+        self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+        
+        # Ensure we have at least one input parameter
+        input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+        if not input_list:
+            raise RuntimeError("No input parameters found - TVM Relax functions must have parameters")
+        
+        self._debug_log(f"Input list has {len(input_list)} parameters: {[v.name_hint for v in input_list]}")
+
+        # Create function with input parameters
+        with self.bb.function("main", input_list):  # Pass inputs to function signature
+            with self.bb.dataflow():
+                self._debug_log("Starting dataflow block")
+                
+                self._convert_operators(model)
+                self._debug_log(f"Converted operators")
+
+                # Get outputs
+                subgraph = model.Subgraphs(0)
+                model_outputs = subgraph.OutputsAsNumpy()
+                self._debug_log(f"Model has {len(model_outputs)} outputs")
+                
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+                outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
+
+                output_var = self.bb.emit_output(outputs)
+                self._debug_log("Emitted output variable")
+
+            # emit_func_output without additional params since they're already in function signature
+            self.bb.emit_func_output(output_var)
+            self._debug_log("Emitted function output")
+
+        # Get the module
+        self._debug_log("Building module")
+        relax_mod = self.bb.get()
+        
+        # Add function attributes
+        func_attrs = {"num_input": len(input_list)}
+        try:
+            main_func = relax_mod["main"]
+            relax_mod["main"] = main_func.with_attrs(func_attrs)
+            self._debug_log("Attached function attributes")
+        except Exception as attr_e:
+            self._debug_log(f"Error attaching attributes: {attr_e}")
+            raise       
+        
+        self._debug_log("Conversion complete")
+        print(f"Function created with {len(input_list)} input parameters")
+        return relax_mod, {}
+    def long_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model - Corrected TVM pattern."""
         self._debug_log("Starting TFLite to Relax conversion")
         
@@ -1094,20 +1152,23 @@ class TFLiteGraphImporter:
         }
 
     def _parse_model_inputs(self, model):
-        """Parse model inputs and create Relax variables - FIXED for consistent naming."""
+        """Parse model inputs and create Relax variables - Debug version."""
         subgraph = model.Subgraphs(0)
         model_inputs = subgraph.InputsAsNumpy()
+        
+        print(f"DEBUG: Found {len(model_inputs)} model inputs: {model_inputs}")
 
         for model_input in model_inputs:
-            input_name = get_tensor_name(subgraph, model_input)  # Already sanitized
+            input_name = get_tensor_name(subgraph, model_input)
             tensor = subgraph.Tensors(model_input)
+            
+            print(f"DEBUG: Processing input {model_input}: {input_name}")
 
             # Get shape and dtype
             if input_name in self._shape:
                 shape = self._shape[input_name]
             else:
                 if tensor.ShapeLength() > 0:
-                    # Simple conversion: numpy int32 -> Python int
                     raw_shape = tensor.ShapeAsNumpy()
                     shape = tuple(int(dim) for dim in raw_shape)
                 else:
@@ -1120,17 +1181,21 @@ class TFLiteGraphImporter:
             else:
                 dtype = self._get_tensor_type_str(tensor.Type())
 
-            # Create Relax variable with sanitized name
+            # Create Relax variable
             input_var = relax.Var(
-                name_hint=input_name,  # Already sanitized
+                name_hint=input_name,
                 struct_info=relax.TensorStructInfo(shape=shape, dtype=dtype),
             )
 
             self._nodes[input_name] = input_var
-            self._debug_log(f"Created input var: {input_name}, shape: {shape}, dtype: {dtype}")
             self._inputs[input_name] = input_var
             self._num_input += 1
+            
+            print(f"DEBUG: Created input var {input_name}: shape={shape}, dtype={dtype}")
 
+        print(f"DEBUG: Total inputs created: {len(self._inputs)}")
+        print(f"DEBUG: Input names: {list(self._inputs.keys())}")
+        
     def old_parse_model_inputs(self, model):
         """Parse model inputs and create Relax variables."""
         subgraph = model.Subgraphs(0)
@@ -1349,6 +1414,31 @@ class TFLiteGraphImporter:
             raise NotImplementedError(f"Tensor type {tensor_type} is not supported")
         
     def _get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor - Using constants for weights."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
+
+        if tensor_name in self._nodes:
+            self._debug_log(f"Found existing node for: {tensor_name}")
+            return self._nodes[tensor_name]
+        else:
+            # Check if this tensor has constant data (weights/biases)
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            # Get the tensor value as numpy array
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            self._debug_log(f"Creating CONSTANT: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
+
+            # Use constant directly - this avoids variable reference issues
+            const_expr = relax.const(value, dtype)
+            self._nodes[tensor_name] = const_expr
+            self._debug_log(f"Added constant {tensor_name} to nodes")
+            return const_expr
+        
+    def complex_get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor - FIXED for consistent naming."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
         self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
