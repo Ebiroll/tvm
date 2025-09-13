@@ -671,6 +671,13 @@ class TFLiteGraphImporter:
 
         self._debug_log("Conversion complete")
         print(f"Final parameters dict has {len(np_params)} entries")
+        # DEBUG: Print parameter names to check for consistency
+        print("\n=== Parameter Name Check ===")
+        for name, arr in np_params.items():
+            print(f"  {name}: shape={arr.shape}, dtype={arr.dtype}")
+        
+        # DEBUG: Analyze the IR before returning
+        debug_ir_variables(relax_mod)
         return relax_mod, np_params
 
     def working_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
