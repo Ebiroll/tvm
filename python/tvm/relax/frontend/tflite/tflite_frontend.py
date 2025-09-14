@@ -594,47 +594,190 @@ class TFLiteGraphImporter:
             raise
 
     def from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
-        """Construct Relax expressions from the TFLite model - Fixed to ensure parameters exist."""
+        """TFLite to Relax conversion using constants approach - FIXED."""
         self._debug_log("Starting TFLite to Relax conversion")
         
-        # Store model reference for use in other methods
+        # Store model reference
         self.current_model = model
 
-        # CRITICAL: Parse inputs BEFORE creating function to ensure we have input parameters
+        # Parse inputs
         self._parse_model_inputs(model)
         self._debug_log(f"Parsed {len(self._inputs)} model inputs")
         
-        # Ensure we have at least one input parameter
-        input_list = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
-        if not input_list:
-            raise RuntimeError("No input parameters found - TVM Relax functions must have parameters")
+        # Get input variables (only actual model inputs)
+        input_vars = [var for var in self._inputs.values() if isinstance(var, relax.Var)]
+        if not input_vars:
+            raise RuntimeError("No input parameters found")
         
-        self._debug_log(f"Input list has {len(input_list)} parameters: {[v.name_hint for v in input_list]}")
+        self._debug_log(f"Input variables: {[v.name_hint for v in input_vars]}")
 
-        # Create function with input parameters
-        with self.bb.function("main", input_list):  # Pass inputs to function signature
+        # Create function with ONLY model inputs (no parameter variables)
+        with self.bb.function("main", input_vars):
             with self.bb.dataflow():
                 self._debug_log("Starting dataflow block")
                 
+                # Convert operators - this will create constants for weights
                 self._convert_operators(model)
-                self._debug_log(f"Converted operators")
+                self._debug_log("Converted operators")
 
                 # Get outputs
                 subgraph = model.Subgraphs(0)
                 model_outputs = subgraph.OutputsAsNumpy()
                 self._debug_log(f"Model has {len(model_outputs)} outputs")
                 
-                # old version
-                #outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
-                #outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
-
-                #output_var = self.bb.emit_output(outputs)
-                #self._debug_log("Emitted output variable")
+                # Get output expressions
                 outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+
+                # Make outputs contiguous (with better error handling)
+                contiguous_outputs = []
+                for i, output in enumerate(outputs):
+                    self._debug_log(f"Making output {i} contiguous")
+                    try:
+                        # Try to get concrete shape for reshape
+                        original_shape = output.struct_info.shape
+                        
+                        # Check if we have a concrete shape
+                        concrete_shape = []
+                        is_concrete = True
+                        
+                        for dim in original_shape:
+                            if isinstance(dim, (int, tvm.tir.IntImm)):
+                                if hasattr(dim, 'value'):
+                                    concrete_shape.append(int(dim.value))
+                                else:
+                                    concrete_shape.append(int(dim))
+                            elif hasattr(dim, 'value') and isinstance(dim.value, int):
+                                concrete_shape.append(int(dim.value))
+                            else:
+                                # Symbolic dimension
+                                is_concrete = False
+                                break
+                        
+                        if is_concrete and len(concrete_shape) > 0:
+                            # Safe to use flatten-reshape with concrete shape
+                            flattened = self.bb.normalize(relax.op.reshape(output, [-1]))
+                            contiguous = self.bb.normalize(relax.op.reshape(flattened, concrete_shape))
+                            contiguous_outputs.append(contiguous)
+                            self._debug_log(f"Made output {i} contiguous using concrete shape")
+                        else:
+                            # For symbolic shapes, just use the output as-is
+                            contiguous_outputs.append(output)
+                            self._debug_log(f"Keeping output {i} as-is (symbolic shape)")
+                            
+                    except Exception as e:
+                        self._debug_log(f"Contiguous conversion failed for output {i}: {e}")
+                        contiguous_outputs.append(output)  # Use original
+                
+                # Create final output
+                final_outputs = contiguous_outputs[0] if len(contiguous_outputs) == 1 else relax.Tuple(contiguous_outputs)
+                output_var = self.bb.emit_output(final_outputs)
+                self._debug_log("Emitted output variable")
+
+            # CRITICAL FIX: Use emit_func_output WITHOUT params
+            # Since we're using constants, no separate parameters needed
+            self.bb.emit_func_output(output_var)
+            self._debug_log("Emitted function output without parameters")
+
+        # Build the module
+        relax_mod = self.bb.get()
+        
+        # Add function attributes
+        func_attrs = {
+            "num_input": len(input_vars),
+        }
+        
+        try:
+            main_func = relax_mod["main"]
+            relax_mod["main"] = main_func.with_attrs(func_attrs)
+            self._debug_log(f"Attached function attributes: {func_attrs}")
+        except Exception as e:
+            self._debug_log(f"Error attaching attributes: {e}")
+
+        # Return empty params dict since weights are embedded as constants
+        self._debug_log("Conversion complete")
+        return relax_mod, {}
     
-                # CRITICAL FIX: Make ALL outputs contiguous (even passthrough inputs)
+    def _get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor - CONSTANTS ONLY approach."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+        self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
+
+        if tensor_name in self._nodes:
+            self._debug_log(f"Found existing node for: {tensor_name}")
+            return self._nodes[tensor_name]
+        else:
+            # Check if this tensor has constant data (weights/biases)
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            # Get the tensor value as numpy array
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            self._debug_log(f"Creating CONSTANT: {tensor_name}, shape: {value.shape}, dtype: {dtype}")
+
+            # CRITICAL: Use constants ONLY - no parameter variables
+            const_expr = relax.const(value, dtype)
+            self._nodes[tensor_name] = const_expr
+            
+            # DO NOT store in self._params - this was causing the conflict
+            
+            self._debug_log(f"Added constant {tensor_name} to nodes")
+            return const_expr
+    
+    def alt_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
+        """Construct Relax expressions from the TFLite model - Fixed parameter handling."""
+        self._debug_log("Starting TFLite to Relax conversion")
+        
+        # Store model reference for use in other methods
+        self.current_model = model
+
+        # Parse inputs BEFORE creating function
+        self._parse_model_inputs(model)
+        self._debug_log(f"Parsed {len(self._inputs)} model inputs")
+        
+        # Get input parameters (actual function inputs)
+        input_vars = [value for value in self._inputs.values() if isinstance(value, relax.Var)]
+        if not input_vars:
+            raise RuntimeError("No input parameters found - TVM Relax functions must have parameters")
+        
+        self._debug_log(f"Input variables: {[v.name_hint for v in input_vars]}")
+
+        # Parse parameters (weights/constants) if needed
+        # This should populate self._params
+        if hasattr(self, '_parse_model_params'):
+            self._parse_model_params(model)
+        
+        # Create complete function parameter list
+        # Function signature = inputs + parameters
+        function_params = input_vars.copy()
+        
+        if self._params:
+            param_vars = [var for var, _ in self._params.values()]
+            function_params.extend(param_vars)
+            self._debug_log(f"Added {len(param_vars)} parameter variables to function signature")
+        
+        self._debug_log(f"Total function parameters: {len(function_params)}")
+
+        # Create function with all parameters
+        with self.bb.function("main", function_params):
+            with self.bb.dataflow():
+                self._debug_log("Starting dataflow block")
+                
+                self._convert_operators(model)
+                self._debug_log("Converted operators")
+
+                # Get outputs
+                subgraph = model.Subgraphs(0)
+                model_outputs = subgraph.OutputsAsNumpy()
+                self._debug_log(f"Model has {len(model_outputs)} outputs")
+                
+                # Get output tensors
+                outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
+
+                # CRITICAL FIX: Make ALL outputs contiguous
                 def ensure_contiguous(tensor_expr):
-                    """Force contiguous layout - Fixed version that handles symbolic shapes."""
+                    """Force contiguous layout - handles both concrete and symbolic shapes."""
                     try:
                         original_shape = tensor_expr.struct_info.shape
                         
@@ -684,42 +827,58 @@ class TFLiteGraphImporter:
                     except Exception as e:
                         # Final fallback: return tensor as-is if contiguous operation fails
                         self._debug_log(f"Contiguous operation failed, returning original tensor: {e}")
-                        return tensor_expr                
+                        return tensor_expr
+                
+                # Make all outputs contiguous
                 contiguous_outputs = []
                 for i, output in enumerate(outputs):
                     self._debug_log(f"Making output {i} contiguous")
                     contiguous_output = ensure_contiguous(output)
                     contiguous_outputs.append(contiguous_output)
                 
+                # Create final output (single tensor or tuple)
                 final_outputs = contiguous_outputs[0] if len(contiguous_outputs) == 1 else relax.Tuple(contiguous_outputs)
                 output_var = self.bb.emit_output(final_outputs)
+                self._debug_log("Emitted output variable")
 
-            # emit_func_output without additional params since they're already in function signature
+            # Emit function output
             self.bb.emit_func_output(output_var)
             self._debug_log("Emitted function output")
 
-        # Get the module
+        # Build the module
         self._debug_log("Building module")
         relax_mod = self.bb.get()
         
         # Add function attributes
-        func_attrs = {"num_input": len(input_list)}
+        func_attrs = {
+            "num_input": len(input_vars),  # Only count actual model inputs, not parameters
+            "num_params": len(self._params) if self._params else 0
+        }
+        
         try:
             main_func = relax_mod["main"]
             relax_mod["main"] = main_func.with_attrs(func_attrs)
-            self._debug_log("Attached function attributes")
+            self._debug_log(f"Attached function attributes: {func_attrs}")
         except Exception as attr_e:
             self._debug_log(f"Error attaching attributes: {attr_e}")
-            raise       
-        
+            raise
+
+        # Prepare numpy parameters dictionary
+        np_params = {}
+        if self._params:
+            for name, (var, numpy_array) in self._params.items():
+                np_params[name] = numpy_array
+            self._debug_log(f"Prepared {len(np_params)} numpy parameters")
+
         self._debug_log("Conversion complete")
-        print(f"Function created with {len(input_list)} input parameters")
-        return relax_mod, {}
+        self._debug_log(f"Function created with {len(function_params)} total parameters ({len(input_vars)} inputs + {len(self._params) if self._params else 0} model params)")
+        
+        return relax_mod, np_params
     
 
     def long_from_tflite(self, model) -> Tuple[IRModule, Dict[str, np.ndarray]]:
         """Construct Relax expressions from the TFLite model - Corrected TVM pattern."""
-        self._debug_log("Starting TFLite to Relax conversion")
+        self._debug_log("Starting TFLite to Relax conversion ZZZZZZZZZZZZZZZZZZ")
         
         # Store model reference for use in other methods
         self.current_model = model
@@ -1227,7 +1386,27 @@ class TFLiteGraphImporter:
         except KeyError:
             raise NotImplementedError(f"Tensor type {tensor_type} is not supported")
         
-    def _get_tensor_expr(self, tensor_wrapper):
+    def _bad_get_tensor_expr(self, tensor_wrapper):
+        """Get Relax expression for a tensor - Parameter approach with contiguity fix."""
+        tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
+
+        if tensor_name in self._nodes:
+            return self._nodes[tensor_name]
+        else:
+            if not self._has_tensor_value(tensor_wrapper):
+                raise ValueError(f"Tensor '{tensor_name}' is not an input and has no constant value.")
+
+            value = self._get_tensor_value(tensor_wrapper)
+            dtype = self._get_tensor_type_str(tensor_wrapper.tensor.Type())
+            
+            # Use parameter approach (like before)
+            param_var = relax.Var(tensor_name, relax.TensorStructInfo(value.shape, dtype))
+            self._nodes[tensor_name] = param_var
+            # Store the parameter and its value
+            self._params[tensor_name] = (param_var, value)
+            return param_var
+            
+    def nopar_get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor - Using constants for weights."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
         self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
