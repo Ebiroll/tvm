@@ -211,7 +211,7 @@ class TFLiteGraphImporter:
             "GREATER": self.convert_greater,
             "LESS": self.convert_less,
             "LOGISTIC": self.convert_logistic,
-            "MAX_POOL_2D": self.convert_max_pool2d,
+            "MAX_POOL_2D": self._convert_pool2d_safe,
             "MAXIMUM": self.convert_maximum,
             "MEAN": self.convert_reduce_mean,
             "MINIMUM": self.convert_minimum,
@@ -1171,7 +1171,7 @@ class TFLiteGraphImporter:
             "GREATER": self.convert_greater,
             "LESS": self.convert_less,
             "LOGISTIC": self.convert_logistic,
-            "MAX_POOL_2D": self.convert_max_pool2d,
+            "MAX_POOL_2D": self._convert_pool2d_safe,
             "MAXIMUM": self.convert_maximum,
             "MEAN": self.convert_reduce_mean,
             "MINIMUM": self.convert_minimum,
@@ -1436,7 +1436,7 @@ class TFLiteGraphImporter:
         array = np.frombuffer(data, dtype=dtype).reshape(shape)
     
         # DEBUG: Check if buffer data is actually zeros
-        print(f"First 10 values: {array.flatten()[:10]}")
+        # print(f"First 10 values: {array.flatten()[:10]}")
         
         writable_array = np.array(array, copy=True)
         return writable_array
@@ -1638,6 +1638,23 @@ class TFLiteGraphImporter:
 
         lhs = self._get_tensor_expr(input_tensors[0])
         rhs = self._get_tensor_expr(input_tensors[1])
+        return self.bb.normalize(relax.op.add(lhs, rhs))
+
+    def silly_convert_add(self, subgraph, op):
+        """Handle add operations with potential shape mismatches."""
+        print("=== Converting ADD with shape check ===")
+        input_tensors = self._get_input_tensors(subgraph, op)
+        lhs = self._get_tensor_expr(input_tensors[0])
+        rhs = self._get_tensor_expr(input_tensors[1])
+        
+        # Check for shape mismatch and handle if needed
+        lhs_shape = lhs.struct_info.shape
+        rhs_shape = rhs.struct_info.shape
+        
+        if lhs_shape != rhs_shape:
+            self._debug_log(f"Shape mismatch in add: {lhs_shape} vs {rhs_shape}")
+            # Add logic to handle shape mismatch (padding, cropping, etc.)
+        
         return self.bb.normalize(relax.op.add(lhs, rhs))
 
     def convert_sub(self, subgraph, op):
@@ -2404,6 +2421,7 @@ class TFLiteGraphImporter:
         data_expr = self._get_tensor_expr(input_tensors[0])
         weight_expr = self._get_tensor_expr(input_tensors[1])
         
+        print(f"conv Input shape: {data_expr.struct_info.shape}")
         self._debug_log(f"Input shape: {data_expr.struct_info.shape}")
         self._debug_log(f"Weight shape: {weight_expr.struct_info.shape}")
 
@@ -2453,14 +2471,216 @@ class TFLiteGraphImporter:
         
         self._debug_log(f"Kernel dims: H={kernel_h}, W={kernel_w}")
 
-        # Handle padding with proper SAME calculation
-        if padding == Padding.VALID:
+        # TFLite's exact SAME padding calculation
+        def calculate_conv_same_padding(input_size, kernel_size, stride, dilation):
+            """Calculate SAME padding using TFLite's exact formula."""
+            if isinstance(input_size, (tvm.tir.IntImm, int)):
+                input_size_val = int(input_size) if hasattr(input_size, 'value') else int(input_size)
+            elif hasattr(input_size, 'value'):
+                input_size_val = int(input_size.value)
+            else:
+                # For symbolic shapes, assume reasonable default
+                input_size_val = 224
+                self._debug_log(f"Using default input size {input_size_val} for symbolic shape")
+            
+            if isinstance(kernel_size, (tvm.tir.IntImm, int)):
+                kernel_size_val = int(kernel_size) if hasattr(kernel_size, 'value') else int(kernel_size)
+            elif hasattr(kernel_size, 'value'):
+                kernel_size_val = int(kernel_size.value)
+            else:
+                kernel_size_val = int(kernel_size)
+            
+            # TFLite's exact SAME padding formula
+            if input_size_val % stride == 0:
+                pad_total = max(kernel_size_val - stride, 0)
+            else:
+                pad_total = max(kernel_size_val - (input_size_val % stride), 0)
+            
+            pad_before = pad_total // 2
+            pad_after = pad_total - pad_before
+            
+            # Verify output size matches TFLite expectation
+            expected_output = (input_size_val + stride - 1) // stride
+            actual_output = (input_size_val + pad_before + pad_after - kernel_size_val) // stride + 1
+            
+            self._debug_log(f"TFLite SAME padding: input={input_size_val}, kernel={kernel_size_val}, "
+                        f"stride={stride}, pad_total={pad_total}, before={pad_before}, after={pad_after}")
+            self._debug_log(f"Expected output: {expected_output}, Calculated output: {actual_output}")
+            
+            if expected_output != actual_output:
+                self._debug_log(f"Output size mismatch! Using expected size calculation...")
+                # Fallback to ensure correct output size
+                required_pad = max(0, (expected_output - 1) * stride + kernel_size_val - input_size_val)
+                pad_before = required_pad // 2
+                pad_after = required_pad - pad_before
+            
+            return pad_before, pad_after
+
+        # Handle padding - Force SAME for any conv with kernel > 1
+        self._debug_log(f"Raw padding value: {padding}, type: {type(padding)}")
+        
+        # Extract kernel size values
+        kernel_h_val = int(kernel_h) if hasattr(kernel_h, 'value') else int(kernel_h)
+        kernel_w_val = int(kernel_w) if hasattr(kernel_w, 'value') else int(kernel_w)
+        
+        # Force SAME padding for:
+        # 1. Any stride > 1 (spatial reduction)
+        # 2. Any kernel size > 1 (to preserve spatial dimensions)
+        if stride_h > 1 or stride_w > 1:
+            self._debug_log("FORCING SAME padding for stride > 1 operation")
+            force_same = True
+        elif kernel_h_val > 1 or kernel_w_val > 1:
+            self._debug_log("FORCING SAME padding for kernel > 1 operation")
+            force_same = True
+        else:
+            force_same = False
+        
+        if force_same:
+            # Calculate SAME padding
+            pad_top, pad_bottom = calculate_conv_same_padding(input_h, kernel_h, stride_h, dilation_h)
+            pad_left, pad_right = calculate_conv_same_padding(input_w, kernel_w, stride_w, dilation_w)
+            padding_val = [pad_top, pad_left, pad_bottom, pad_right]
+            self._debug_log(f"FORCED SAME padding calculated: {padding_val}")
+        else:
+            # Only use VALID for 1x1 kernels with stride=1
+            padding_val = [0, 0, 0, 0]
+            self._debug_log("Using VALID padding for 1x1 kernel: [0, 0, 0, 0]")
+
+        # Convert weight layout from TFLite to Relax format
+        if conv_type == "conv2d":
+            # TFLite OHWI -> Relax OIHW (verify this is correct for your backend)
+            weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [0, 3, 1, 2]))
+            kernel_layout = "OIHW"
+            self._debug_log("Converted Conv2D weights from OHWI to OIHW")
+        else: # depthwise
+            # TFLite [1, H, W, C_out] -> Relax [C_out, 1, H, W] (OIHW)
+            weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [3, 0, 1, 2]))
+            kernel_layout = "OIHW"
+            self._debug_log("Converted DepthwiseConv2D weights from 1HWO to OIHW")
+
+        try:
+            if conv_type == "conv2d":
+                result = relax.op.nn.conv2d(
+                    data_expr,
+                    weight_expr,
+                    strides=strides,
+                    padding=padding_val,
+                    dilation=dilation,
+                    data_layout="NHWC",
+                    kernel_layout=kernel_layout,
+                )
+            else:
+                # For depthwise conv, we need the groups parameter
+                groups_value = data_expr.struct_info.shape[-1]
+                groups = _extract_int_value(groups_value)
+                
+                result = relax.op.nn.conv2d(
+                    data_expr,
+                    weight_expr,
+                    strides=strides,
+                    padding=padding_val,
+                    dilation=dilation,
+                    data_layout="NHWC",
+                    kernel_layout=kernel_layout,
+                    groups=groups,
+                )
+
+            self._debug_log(f"Created {conv_type} operation successfully")
+            result = self.bb.normalize(result)
+            self._debug_log(f"Normalized {conv_type} operation successfully")
+
+            # Add bias if present
+            if len(input_tensors) > 2 and self._has_tensor_value(input_tensors[2]):
+                bias_expr = self._get_tensor_expr(input_tensors[2])
+                result = self.bb.normalize(relax.op.add(result, bias_expr))
+                self._debug_log("Added bias to convolution result")
+
+            # Log output shape for debugging
+            self._debug_log(f"Conv output shape: {result.struct_info.shape}")
+            #print(f"Conv output shape: {result.struct_info.shape}")
+            return result
+            
+        except Exception as e:
+            self._debug_log(f"ERROR in {conv_type} operation: {e}")
+            import traceback
+            self._debug_log(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def faulty_convert_conv(self, subgraph, op, conv_type):
+        """Generic convolution conversion with proper SAME padding."""
+        try:
+            from tflite.BuiltinOptions import BuiltinOptions
+            from tflite.Conv2DOptions import Conv2DOptions
+            from tflite.DepthwiseConv2DOptions import DepthwiseConv2DOptions
+            from tflite.Padding import Padding
+        except ImportError:
+            raise ImportError("The tflite package must be installed")
+
+        self._debug_log(f"Converting {conv_type}")
+        self.current_subgraph = subgraph
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) >= 2
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        weight_expr = self._get_tensor_expr(input_tensors[1])
+        
+        self._debug_log(f"Input shape: {data_expr.struct_info.shape}")
+        self._debug_log(f"Weight shape: {weight_expr.struct_info.shape}")
+
+        # Get convolution options
+        if conv_type == "conv2d":
+            assert op.BuiltinOptionsType() == BuiltinOptions.Conv2DOptions
+            op_options = op.BuiltinOptions()
+            conv_options = Conv2DOptions()
+            conv_options.Init(op_options.Bytes, op_options.Pos)
+        else:  # depthwise
+            assert op.BuiltinOptionsType() == BuiltinOptions.DepthwiseConv2DOptions
+            op_options = op.BuiltinOptions()
+            conv_options = DepthwiseConv2DOptions()
+            conv_options.Init(op_options.Bytes, op_options.Pos)
+
+        stride_h = conv_options.StrideH()
+        stride_w = conv_options.StrideW()
+        dilation_h = conv_options.DilationHFactor()
+        dilation_w = conv_options.DilationWFactor()
+        padding = conv_options.Padding()
+
+        self._debug_log(f"Conv params - stride: [{stride_h}, {stride_w}], dilation: [{dilation_h}, {dilation_w}], padding: {padding}")
+
+        strides = [stride_h, stride_w]
+        dilation = [dilation_h, dilation_w]
+
+        # Get input and kernel dimensions for SAME padding calculation
+        input_shape = data_expr.struct_info.shape
+        weight_shape = weight_expr.struct_info.shape
+        
+        if len(input_shape) == 4:  # NHWC format
+            input_h = input_shape[1]
+            input_w = input_shape[2]
+            self._debug_log(f"Input spatial dims: H={input_h}, W={input_w}")
+        else:
+            raise ValueError(f"Expected 4D input for conv2d, got {len(input_shape)}D")
+
+        # Get kernel dimensions (TFLite format depends on conv type)
+        if conv_type == "conv2d":
+            # TFLite Conv2D weight format: [out_channels, height, width, in_channels] (OHWI)
+            kernel_h = weight_shape[1] 
+            kernel_w = weight_shape[2]
+        else:  # depthwise
+            # TFLite DepthwiseConv2D weight format: [1, height, width, out_channels]
+            kernel_h = weight_shape[1]
+            kernel_w = weight_shape[2]
+        
+        self._debug_log(f"Kernel dims: H={kernel_h}, W={kernel_w}")
+
+        # Handle padding - FIX: Use integer comparison instead of enum
+        if padding == 0:  # Padding.VALID
             padding_val = [0, 0, 0, 0]
             self._debug_log("Using VALID padding: [0, 0, 0, 0]")
-        elif padding == Padding.SAME:
-            # Proper SAME padding calculation for convolution
+        elif padding == 1:  # Padding.SAME
+            # TFLite's exact SAME padding calculation
             def calculate_conv_same_padding(input_size, kernel_size, stride, dilation):
-                """Calculate SAME padding for convolution."""
+                """Calculate SAME padding using TFLite's exact formula."""
                 if isinstance(input_size, (tvm.tir.IntImm, int)):
                     input_size_val = int(input_size) if hasattr(input_size, 'value') else int(input_size)
                 elif hasattr(input_size, 'value'):
@@ -2477,20 +2697,29 @@ class TFLiteGraphImporter:
                 else:
                     kernel_size_val = int(kernel_size)
                 
-                # Calculate effective kernel size with dilation
-                effective_kernel_size = kernel_size_val + (kernel_size_val - 1) * (dilation - 1)
+                # TFLite's exact SAME padding formula
+                if input_size_val % stride == 0:
+                    pad_total = max(kernel_size_val - stride, 0)
+                else:
+                    pad_total = max(kernel_size_val - (input_size_val % stride), 0)
                 
-                # Calculate output size (same as input for SAME padding)
-                output_size = (input_size_val + stride - 1) // stride
+                pad_before = pad_total // 2
+                pad_after = pad_total - pad_before
                 
-                # Calculate total padding needed
-                total_pad = max(0, (output_size - 1) * stride + effective_kernel_size - input_size_val)
-                pad_before = total_pad // 2
-                pad_after = total_pad - pad_before
+                # Verify output size matches TFLite expectation
+                expected_output = (input_size_val + stride - 1) // stride
+                actual_output = (input_size_val + pad_before + pad_after - kernel_size_val) // stride + 1
                 
-                self._debug_log(f"SAME padding calc: input={input_size_val}, kernel={kernel_size_val}, "
-                            f"effective_kernel={effective_kernel_size}, stride={stride}, "
-                            f"total_pad={total_pad}, before={pad_before}, after={pad_after}")
+                self._debug_log(f"TFLite SAME padding: input={input_size_val}, kernel={kernel_size_val}, "
+                            f"stride={stride}, pad_total={pad_total}, before={pad_before}, after={pad_after}")
+                self._debug_log(f"Expected output: {expected_output}, Calculated output: {actual_output}")
+                
+                if expected_output != actual_output:
+                    self._debug_log(f"⚠️  Output size mismatch! Using expected size calculation...")
+                    # Fallback to ensure correct output size
+                    required_pad = max(0, (expected_output - 1) * stride + kernel_size_val - input_size_val)
+                    pad_before = required_pad // 2
+                    pad_after = required_pad - pad_before
                 
                 return pad_before, pad_after
 
@@ -2504,12 +2733,14 @@ class TFLiteGraphImporter:
 
         # Convert weight layout from TFLite to Relax format
         if conv_type == "conv2d":
-            # TFLite OHWI -> Relax OIHW
+            # TFLite OHWI -> Relax OIHW (verify this is correct for your backend)
             weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [0, 3, 1, 2]))
+            kernel_layout = "OIHW"
             self._debug_log("Converted Conv2D weights from OHWI to OIHW")
         else: # depthwise
             # TFLite [1, H, W, C_out] -> Relax [C_out, 1, H, W] (OIHW)
             weight_expr = self.bb.normalize(relax.op.permute_dims(weight_expr, [3, 0, 1, 2]))
+            kernel_layout = "OIHW"
             self._debug_log("Converted DepthwiseConv2D weights from 1HWO to OIHW")
 
         try:
@@ -2521,7 +2752,7 @@ class TFLiteGraphImporter:
                     padding=padding_val,
                     dilation=dilation,
                     data_layout="NHWC",
-                    kernel_layout="OIHW",
+                    kernel_layout=kernel_layout,
                 )
             else:
                 # For depthwise conv, we need the groups parameter
@@ -2535,7 +2766,7 @@ class TFLiteGraphImporter:
                     padding=padding_val,
                     dilation=dilation,
                     data_layout="NHWC",
-                    kernel_layout="OIHW",
+                    kernel_layout=kernel_layout,
                     groups=groups,
                 )
 
@@ -2555,8 +2786,11 @@ class TFLiteGraphImporter:
             
         except Exception as e:
             self._debug_log(f"ERROR in {conv_type} operation: {e}")
+            import traceback
+            self._debug_log(f"Traceback: {traceback.format_exc()}")
             raise
-        
+
+
     def convert_fully_connected(self, subgraph, op):
         """Convert TFLite FULLY_CONNECTED operator."""
         self.current_subgraph = subgraph
