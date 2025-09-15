@@ -228,7 +228,81 @@ class TFLiteGraphImporter:
             "SUB": self.convert_sub,
             "TANH": self.convert_tanh,
             "TRANSPOSE": self.convert_transpose,
+            "REDUCE_MAX": self.convert_reduce_max,
         }
+
+    def convert_reduce_max(self, subgraph, op):
+        """Convert TFLite REDUCE_MAX operator."""
+        from tflite.BuiltinOptions import BuiltinOptions
+        from tflite.ReducerOptions import ReducerOptions
+
+        self.current_subgraph = subgraph
+
+        # TFLite REDUCE_* typically has 2 inputs: data, axes
+        input_tensors = self._get_input_tensors(subgraph, op)
+        assert len(input_tensors) == 2, "REDUCE_MAX expects 2 inputs (data, axes)"
+
+        data_expr = self._get_tensor_expr(input_tensors[0])
+        data_sinfo = data_expr.struct_info
+        rank = len(getattr(data_sinfo, "shape", [])) if hasattr(data_sinfo, "shape") else None
+
+        # ---- Parse axes (2nd input) ----
+        axes_tensor = input_tensors[1]
+        axes = None
+        if self._has_tensor_value(axes_tensor):
+            axes_value = self._get_tensor_value(axes_tensor)
+            if axes_value is not None:
+                raw = axes_value.tolist()  # can be python int or list
+                if isinstance(raw, int):
+                    axes_list = [raw]
+                elif isinstance(raw, list):
+                    axes_list = raw
+                else:
+                    axes_list = []
+
+                self._debug_log(f"ReduceMax axes: raw={raw}, list={axes_list}")
+
+                if len(axes_list) == 0:
+                    axes = []  # explicit no-op reduction
+                else:
+                    # canonicalize negatives, dedup, sort
+                    if rank is not None:
+                        norm = []
+                        for a in axes_list:
+                            a = int(a)
+                            if a < 0:
+                                a += rank
+                            norm.append(a)
+                        axes = sorted(set(norm))
+                    else:
+                        axes = tuple(int(a) for a in axes_list)
+        else:
+            # Some TFLite graphs omit axes input => reduce over all dims
+            if rank is not None:
+                axes = list(range(rank))
+                self._debug_log("ReduceMax: no constant axes tensor; defaulting to all axes")
+            else:
+                axes = None  # let Relax interpret as "all axes"
+
+        # ---- KeepDims ----
+        keepdims = False
+        if op.BuiltinOptionsType() == BuiltinOptions.ReducerOptions:
+            opts = op.BuiltinOptions()
+            ro = ReducerOptions()
+            ro.Init(opts.Bytes, opts.Pos)
+            keepdims = bool(ro.KeepDims())
+
+        # No-op fast path
+        if axes == []:
+            self._debug_log("ReduceMax with empty axes -> identity")
+            return data_expr
+
+        # Build axis argument (int for single axis; list/tuple otherwise)
+        axis_arg = axes[0] if isinstance(axes, list) and len(axes) == 1 else axes
+
+        self._debug_log(f"ReduceMax: axis={axes}, keepdims={keepdims}")
+        return self.bb.normalize(relax.op.max(data_expr, axis=axis_arg, keepdims=keepdims))
+
 
     
     def convert_resize_bilinear(self, subgraph, op):
@@ -629,49 +703,50 @@ class TFLiteGraphImporter:
                 outputs = [self._nodes[get_tensor_name(subgraph, i)] for i in model_outputs]
 
                 # Make outputs contiguous (with better error handling)
-                contiguous_outputs = []
-                for i, output in enumerate(outputs):
-                    self._debug_log(f"Making output {i} contiguous")
-                    try:
-                        # Try to get concrete shape for reshape
-                        original_shape = output.struct_info.shape
-                        
-                        # Check if we have a concrete shape
-                        concrete_shape = []
-                        is_concrete = True
-                        
-                        for dim in original_shape:
-                            if isinstance(dim, (int, tvm.tir.IntImm)):
-                                if hasattr(dim, 'value'):
-                                    concrete_shape.append(int(dim.value))
-                                else:
-                                    concrete_shape.append(int(dim))
-                            elif hasattr(dim, 'value') and isinstance(dim.value, int):
-                                concrete_shape.append(int(dim.value))
-                            else:
-                                # Symbolic dimension
-                                is_concrete = False
-                                break
-                        
-                        if is_concrete and len(concrete_shape) > 0:
-                            # Safe to use flatten-reshape with concrete shape
-                            flattened = self.bb.normalize(relax.op.reshape(output, [-1]))
-                            contiguous = self.bb.normalize(relax.op.reshape(flattened, concrete_shape))
-                            contiguous_outputs.append(contiguous)
-                            self._debug_log(f"Made output {i} contiguous using concrete shape")
-                        else:
-                            # For symbolic shapes, just use the output as-is
-                            contiguous_outputs.append(output)
-                            self._debug_log(f"Keeping output {i} as-is (symbolic shape)")
-                            
-                    except Exception as e:
-                        self._debug_log(f"Contiguous conversion failed for output {i}: {e}")
-                        contiguous_outputs.append(output)  # Use original
+                #contiguous_outputs = []
+                #for i, output in enumerate(outputs):
+                #    self._debug_log(f"Making output {i} contiguous")
+                #    try:
+                #        # Try to get concrete shape for reshape
+                #        original_shape = output.struct_info.shape
+                #        
+                #        # Check if we have a concrete shape
+                #        concrete_shape = []
+                #        is_concrete = True
+                #        
+                #        for dim in original_shape:
+                #            if isinstance(dim, (int, tvm.tir.IntImm)):
+                #                if hasattr(dim, 'value'):
+                #                    concrete_shape.append(int(dim.value))
+                #                else:
+                #                    concrete_shape.append(int(dim))
+                #            elif hasattr(dim, 'value') and isinstance(dim.value, int):
+                #                concrete_shape.append(int(dim.value))
+                #            else:
+                #                # Symbolic dimension
+                #                is_concrete = False
+                #                break
+                #        
+                #        if is_concrete and len(concrete_shape) > 0:
+                #            # Safe to use flatten-reshape with concrete shape
+                #            flattened = self.bb.normalize(relax.op.reshape(output, [-1]))
+                #            contiguous = self.bb.normalize(relax.op.reshape(flattened, concrete_shape))
+                #            contiguous_outputs.append(contiguous)
+                #            self._debug_log(f"Made output {i} contiguous using concrete shape")
+                #        else:
+                #            # For symbolic shapes, just use the output as-is
+                #            contiguous_outputs.append(output)
+                #            self._debug_log(f"Keeping output {i} as-is (symbolic shape)")
+                #            
+                #    except Exception as e:
+                #        self._debug_log(f"Contiguous conversion failed for output {i}: {e}")
+                #        contiguous_outputs.append(output)  # Use original
                 
                 # Create final output
-                final_outputs = contiguous_outputs[0] if len(contiguous_outputs) == 1 else relax.Tuple(contiguous_outputs)
+                #final_outputs = contiguous_outputs[0] if len(contiguous_outputs) == 1 else relax.Tuple(contiguous_outputs)
+                final_outputs = outputs[0] if len(outputs) == 1 else relax.Tuple(outputs)
                 output_var = self.bb.emit_output(final_outputs)
-                self._debug_log("Emitted output variable")
+                print("Emitted output variable",final_outputs)
 
             # CRITICAL FIX: Use emit_func_output WITHOUT params
             # Since we're using constants, no separate parameters needed
@@ -697,7 +772,7 @@ class TFLiteGraphImporter:
         self._debug_log("Conversion complete")
         return relax_mod, {}
     
-    def _get_tensor_expr(self, tensor_wrapper):
+    def last_get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor - CONSTANTS ONLY approach."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
         self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
@@ -1115,6 +1190,7 @@ class TFLiteGraphImporter:
             "SUB": self.convert_sub,
             "TANH": self.convert_tanh,
             "TRANSPOSE": self.convert_transpose,
+            "REDUCE_MAX": self.convert_reduce_max,
         }
 
     def _parse_model_inputs(self, model):
@@ -1406,7 +1482,7 @@ class TFLiteGraphImporter:
             self._params[tensor_name] = (param_var, value)
             return param_var
             
-    def nopar_get_tensor_expr(self, tensor_wrapper):
+    def _get_tensor_expr(self, tensor_wrapper):
         """Get Relax expression for a tensor - Using constants for weights."""
         tensor_name = get_tensor_name(self.current_subgraph, tensor_wrapper.tensor_idx)
         self._debug_log(f"Getting tensor expression for: {tensor_name} (idx: {tensor_wrapper.tensor_idx})")
@@ -2569,6 +2645,7 @@ def from_tflite(
     shape_dict: Optional[Dict[str, List]] = None,
     dtype_dict: Optional[Union[str, Dict[str, str]]] = "float32",
     keep_params_in_input: bool = True,
+    sanitize_input_names: bool = True,
 ) -> Tuple[IRModule, Dict[str, np.ndarray]]:
     """Construct Relax expressions from the TFLite model.
     
